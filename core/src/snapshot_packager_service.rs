@@ -1,15 +1,16 @@
 use crate::cluster_info::{ClusterInfo, MAX_SNAPSHOT_HASHES};
-use solana_runtime::{snapshot_package::AccountsPackageReceiver, snapshot_utils};
+use solana_runtime::{snapshot_package::AccountsPackage, snapshot_utils};
 use solana_sdk::{clock::Slot, hash::Hash};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::RecvTimeoutError,
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, Builder, JoinHandle},
     time::Duration,
 };
+
+pub type PendingSnapshotPackage = Arc<Mutex<Option<AccountsPackage>>>;
 
 pub struct SnapshotPackagerService {
     t_snapshot_packager: JoinHandle<()>,
@@ -17,7 +18,7 @@ pub struct SnapshotPackagerService {
 
 impl SnapshotPackagerService {
     pub fn new(
-        snapshot_package_receiver: AccountsPackageReceiver,
+        pending_snapshot_package: PendingSnapshotPackage,
         starting_snapshot_hash: Option<(Slot, Hash)>,
         exit: &Arc<AtomicBool>,
         cluster_info: &Arc<ClusterInfo>,
@@ -26,7 +27,7 @@ impl SnapshotPackagerService {
         let cluster_info = cluster_info.clone();
 
         let t_snapshot_packager = Builder::new()
-            .name("solana-snapshot-packager".to_string())
+            .name("snapshot-packager".to_string())
             .spawn(move || {
                 let mut hashes = vec![];
                 if let Some(starting_snapshot_hash) = starting_snapshot_hash {
@@ -38,32 +39,26 @@ impl SnapshotPackagerService {
                         break;
                     }
 
-                    match snapshot_package_receiver.recv_timeout(Duration::from_secs(1)) {
-                        Ok(mut snapshot_package) => {
-                            // Only package the latest
-                            while let Ok(new_snapshot_package) =
-                                snapshot_package_receiver.try_recv()
-                            {
-                                snapshot_package = new_snapshot_package;
+                    let snapshot_package = pending_snapshot_package.lock().unwrap().take();
+                    if let Some(snapshot_package) = snapshot_package {
+                        if let Err(err) =
+                            snapshot_utils::archive_snapshot_package(&snapshot_package)
+                        {
+                            warn!("Failed to create snapshot archive: {}", err);
+                        } else {
+                            hashes.push((snapshot_package.slot, snapshot_package.hash));
+                            while hashes.len() > MAX_SNAPSHOT_HASHES {
+                                hashes.remove(0);
                             }
-                            if let Err(err) =
-                                snapshot_utils::archive_snapshot_package(&snapshot_package)
-                            {
-                                warn!("Failed to create snapshot archive: {}", err);
-                            } else {
-                                hashes.push((snapshot_package.root, snapshot_package.hash));
-                                while hashes.len() > MAX_SNAPSHOT_HASHES {
-                                    hashes.remove(0);
-                                }
-                                cluster_info.push_snapshot_hashes(hashes.clone());
-                            }
+                            cluster_info.push_snapshot_hashes(hashes.clone());
                         }
-                        Err(RecvTimeoutError::Disconnected) => break,
-                        Err(RecvTimeoutError::Timeout) => (),
+                    } else {
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
             })
             .unwrap();
+
         Self {
             t_snapshot_packager,
         }
@@ -81,7 +76,7 @@ mod tests {
     use solana_runtime::{
         accounts_db::AccountStorageEntry,
         bank::BankSlotDelta,
-        bank_forks::CompressionType,
+        bank_forks::ArchiveFormat,
         snapshot_package::AccountsPackage,
         snapshot_utils::{self, SnapshotVersion, SNAPSHOT_STATUS_CACHE_FILE_NAME},
     };
@@ -163,7 +158,7 @@ mod tests {
         let output_tar_path = snapshot_utils::get_snapshot_archive_path(
             &snapshot_package_output_path,
             &(42, Hash::default()),
-            &CompressionType::Bzip2,
+            ArchiveFormat::TarBzip2,
         );
         let snapshot_package = AccountsPackage::new(
             5,
@@ -173,7 +168,7 @@ mod tests {
             vec![storage_entries],
             output_tar_path.clone(),
             Hash::default(),
-            CompressionType::Bzip2,
+            ArchiveFormat::TarBzip2,
             SnapshotVersion::default(),
         );
 
@@ -198,7 +193,7 @@ mod tests {
             output_tar_path,
             snapshots_dir,
             accounts_dir,
-            CompressionType::Bzip2,
+            ArchiveFormat::TarBzip2,
         );
     }
 }

@@ -8,16 +8,22 @@ use crate::{
     crds_gossip_error::CrdsGossipError,
     crds_gossip_pull::{CrdsFilter, CrdsGossipPull, ProcessPullStats},
     crds_gossip_push::{CrdsGossipPush, CRDS_GOSSIP_NUM_ACTIVE},
-    crds_value::{CrdsValue, CrdsValueLabel},
+    crds_value::{CrdsData, CrdsValue, CrdsValueLabel},
+    duplicate_shred::{self, DuplicateShredIndex, LeaderScheduleFn, MAX_DUPLICATE_SHREDS},
 };
 use rayon::ThreadPool;
-use solana_sdk::{hash::Hash, pubkey::Pubkey};
+use solana_ledger::shred::Shred;
+use solana_sdk::{
+    hash::Hash,
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    timing::timestamp,
+};
 use std::collections::{HashMap, HashSet};
 
 ///The min size for bloom filters
 pub const CRDS_GOSSIP_DEFAULT_BLOOM_ITEMS: usize = 500;
 
-#[derive(Clone)]
 pub struct CrdsGossip {
     pub crds: Crds,
     pub id: Pubkey,
@@ -106,9 +112,71 @@ impl CrdsGossip {
         (self.id, push_messages)
     }
 
+    pub(crate) fn push_duplicate_shred(
+        &mut self,
+        keypair: &Keypair,
+        shred: &Shred,
+        other_payload: &[u8],
+        leader_schedule: Option<impl LeaderScheduleFn>,
+        // Maximum serialized size of each DuplicateShred chunk payload.
+        max_payload_size: usize,
+    ) -> Result<(), duplicate_shred::Error> {
+        let pubkey = keypair.pubkey();
+        // Skip if there are already records of duplicate shreds for this slot.
+        let shred_slot = shred.slot();
+        if self
+            .crds
+            .get_records(&pubkey)
+            .any(|value| match &value.value.data {
+                CrdsData::DuplicateShred(_, value) => value.slot == shred_slot,
+                _ => false,
+            })
+        {
+            return Ok(());
+        }
+        let chunks = duplicate_shred::from_shred(
+            shred.clone(),
+            pubkey,
+            Vec::from(other_payload),
+            leader_schedule,
+            timestamp(),
+            max_payload_size,
+        )?;
+        // Find the index of oldest duplicate shred.
+        let mut num_dup_shreds = 0;
+        let offset = self
+            .crds
+            .get_records(&pubkey)
+            .filter_map(|value| match &value.value.data {
+                CrdsData::DuplicateShred(ix, value) => {
+                    num_dup_shreds += 1;
+                    Some((value.wallclock, *ix))
+                }
+                _ => None,
+            })
+            .min() // Override the oldest records.
+            .map(|(_ /*wallclock*/, ix)| ix)
+            .unwrap_or(0);
+        let offset = if num_dup_shreds < MAX_DUPLICATE_SHREDS {
+            num_dup_shreds
+        } else {
+            offset
+        };
+        let entries = chunks
+            .enumerate()
+            .map(|(k, chunk)| {
+                let index = (offset + k as DuplicateShredIndex) % MAX_DUPLICATE_SHREDS;
+                let data = CrdsData::DuplicateShred(index, chunk);
+                CrdsValue::new_signed(data, keypair)
+            })
+            .collect();
+        self.process_push_message(&pubkey, entries, timestamp());
+        Ok(())
+    }
+
     /// add the `from` to the peer's filter of nodes
     pub fn process_prune_msg(
-        &mut self,
+        &self,
         peer: &Pubkey,
         destination: &Pubkey,
         origin: &[Pubkey],
@@ -174,17 +242,22 @@ impl CrdsGossip {
         self.pull.mark_pull_request_creation_time(from, now)
     }
     /// process a pull request and create a response
-    pub fn process_pull_requests(&mut self, filters: Vec<(CrdsValue, CrdsFilter)>, now: u64) {
+    pub fn process_pull_requests<I>(&mut self, callers: I, now: u64)
+    where
+        I: IntoIterator<Item = CrdsValue>,
+    {
         self.pull
-            .process_pull_requests(&mut self.crds, filters, now);
+            .process_pull_requests(&mut self.crds, callers, now);
     }
 
     pub fn generate_pull_responses(
         &self,
         filters: &[(CrdsValue, CrdsFilter)],
+        output_size_limit: usize, // Limit number of crds values returned.
         now: u64,
     ) -> Vec<Vec<CrdsValue>> {
-        self.pull.generate_pull_responses(&self.crds, filters, now)
+        self.pull
+            .generate_pull_responses(&self.crds, filters, output_size_limit, now)
     }
 
     pub fn filter_pull_responses(
@@ -232,7 +305,12 @@ impl CrdsGossip {
         self.pull.make_timeouts(&self.id, stakes, epoch_ms)
     }
 
-    pub fn purge(&mut self, now: u64, timeouts: &HashMap<Pubkey, u64>) -> usize {
+    pub fn purge(
+        &mut self,
+        thread_pool: &ThreadPool,
+        now: u64,
+        timeouts: &HashMap<Pubkey, u64>,
+    ) -> usize {
         let mut rv = 0;
         if now > self.push.msg_timeout {
             let min = now - self.push.msg_timeout;
@@ -247,7 +325,9 @@ impl CrdsGossip {
             let min = self.pull.crds_timeout;
             assert_eq!(timeouts[&self.id], std::u64::MAX);
             assert_eq!(timeouts[&Pubkey::default()], min);
-            rv = self.pull.purge_active(&mut self.crds, now, &timeouts);
+            rv = self
+                .pull
+                .purge_active(thread_pool, &mut self.crds, now, &timeouts);
         }
         if now > 5 * self.pull.crds_timeout {
             let min = now - 5 * self.pull.crds_timeout;
@@ -255,6 +335,16 @@ impl CrdsGossip {
         }
         self.pull.purge_failed_inserts(now);
         rv
+    }
+
+    // Only for tests and simulations.
+    pub(crate) fn mock_clone(&self) -> Self {
+        Self {
+            crds: self.crds.clone(),
+            push: self.push.mock_clone(),
+            pull: self.pull.clone(),
+            ..*self
+        }
     }
 }
 
@@ -285,8 +375,10 @@ mod test {
 
     #[test]
     fn test_prune_errors() {
-        let mut crds_gossip = CrdsGossip::default();
-        crds_gossip.id = Pubkey::new(&[0; 32]);
+        let mut crds_gossip = CrdsGossip {
+            id: Pubkey::new(&[0; 32]),
+            ..CrdsGossip::default()
+        };
         let id = crds_gossip.id;
         let ci = ContactInfo::new_localhost(&Pubkey::new(&[1; 32]), 0);
         let prune_pubkey = Pubkey::new(&[2; 32]);

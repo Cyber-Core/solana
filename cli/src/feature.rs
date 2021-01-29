@@ -9,19 +9,32 @@ use solana_clap_utils::{input_parsers::*, input_validators::*, keypair::*};
 use solana_cli_output::{QuietDisplay, VerboseDisplay};
 use solana_client::{client_error::ClientError, rpc_client::RpcClient};
 use solana_remote_wallet::remote_wallet::RemoteWalletManager;
-use solana_runtime::{
+use solana_sdk::{
+    clock::Slot,
     feature::{self, Feature},
     feature_set::FEATURE_NAMES,
-};
-use solana_sdk::{
-    clock::Slot, message::Message, pubkey::Pubkey, system_instruction, transaction::Transaction,
+    message::Message,
+    pubkey::Pubkey,
+    transaction::Transaction,
 };
 use std::{collections::HashMap, fmt, sync::Arc};
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ForceActivation {
+    No,
+    Almost,
+    Yes,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum FeatureCliCommand {
-    Status { features: Vec<Pubkey> },
-    Activate { feature: Pubkey },
+    Status {
+        features: Vec<Pubkey>,
+    },
+    Activate {
+        feature: Pubkey,
+        force: ForceActivation,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,6 +138,13 @@ impl FeatureSubCommands for App<'_, '_> {
                                 .index(1)
                                 .required(true)
                                 .help("The signer for the feature to activate"),
+                        )
+                        .arg(
+                            Arg::with_name("force")
+                                .long("yolo")
+                                .hidden(true)
+                                .multiple(true)
+                                .help("Override activation sanity checks. Don't use this flag"),
                         ),
                 ),
         )
@@ -151,13 +171,20 @@ pub fn parse_feature_subcommand(
         ("activate", Some(matches)) => {
             let (feature_signer, feature) = signer_of(matches, "feature", wallet_manager)?;
             let mut signers = vec![default_signer.signer_from_path(matches, wallet_manager)?];
+
+            let force = match matches.occurrences_of("force") {
+                2 => ForceActivation::Yes,
+                1 => ForceActivation::Almost,
+                _ => ForceActivation::No,
+            };
+
             signers.push(feature_signer.unwrap());
             let feature = feature.unwrap();
 
             known_feature(&feature)?;
 
             CliCommandInfo {
-                command: CliCommand::Feature(FeatureCliCommand::Activate { feature }),
+                command: CliCommand::Feature(FeatureCliCommand::Activate { feature, force }),
                 signers,
             }
         }
@@ -188,7 +215,9 @@ pub fn process_feature_subcommand(
 ) -> ProcessResult {
     match feature_subcommand {
         FeatureCliCommand::Status { features } => process_status(rpc_client, config, features),
-        FeatureCliCommand::Activate { feature } => process_activate(rpc_client, config, *feature),
+        FeatureCliCommand::Activate { feature, force } => {
+            process_activate(rpc_client, config, *feature, *force)
+        }
     }
 }
 
@@ -241,7 +270,22 @@ fn feature_activation_allowed(rpc_client: &RpcClient, quiet: bool) -> Result<boo
         .unwrap_or(false);
 
     if !feature_activation_allowed && !quiet {
-        println!("{}", style("Stake By Feature Set:").bold());
+        if active_stake_by_feature_set.get(&my_feature_set).is_none() {
+            println!(
+                "{}",
+                style("To activate features the tool and cluster feature sets must match, select a tool version that matches the cluster")
+                    .bold());
+        } else {
+            println!(
+                "{}",
+                style("To activate features the stake must be >= 95%").bold()
+            );
+        }
+        println!(
+            "{}",
+            style(format!("Tool Feture Set: {}", my_feature_set)).bold()
+        );
+        println!("{}", style("Cluster Feature Sets and Stakes:").bold());
         for (feature_set, percentage) in active_stake_by_feature_set.iter() {
             if *feature_set == 0 {
                 println!("unknown - {}%", percentage);
@@ -279,7 +323,7 @@ fn process_status(
         let feature_id = &feature_ids[i];
         let feature_name = FEATURE_NAMES.get(feature_id).unwrap();
         if let Some(account) = account {
-            if let Some(feature) = Feature::from_account(&account) {
+            if let Some(feature) = feature::from_account(&account) {
                 let feature_status = match feature.activated_at {
                     None => CliFeatureStatus::Pending,
                     Some(activation_slot) => CliFeatureStatus::Active(activation_slot),
@@ -313,20 +357,28 @@ fn process_activate(
     rpc_client: &RpcClient,
     config: &CliConfig,
     feature_id: Pubkey,
+    force: ForceActivation,
 ) -> ProcessResult {
     let account = rpc_client
         .get_multiple_accounts(&[feature_id])?
         .into_iter()
         .next()
         .unwrap();
+
     if let Some(account) = account {
-        if Feature::from_account(&account).is_some() {
+        if feature::from_account(&account).is_some() {
             return Err(format!("{} has already been activated", feature_id).into());
         }
     }
 
     if !feature_activation_allowed(rpc_client, false)? {
-        return Err("Feature activation is not allowed at this time".into());
+        match force {
+        ForceActivation::Almost =>
+            return Err("Add force argument once more to override the sanity check to force feature activation ".into()),
+        ForceActivation::Yes => println!("FEATURE ACTIVATION FORCED"),
+        ForceActivation::No =>
+            return Err("Feature activation is not allowed at this time".into()),
+        }
     }
 
     let rent = rpc_client.get_minimum_balance_for_rent_exemption(Feature::size_of())?;
@@ -340,15 +392,11 @@ fn process_activate(
         &config.signers[0].pubkey(),
         |lamports| {
             Message::new(
-                &[
-                    system_instruction::transfer(
-                        &config.signers[0].pubkey(),
-                        &feature_id,
-                        lamports,
-                    ),
-                    system_instruction::allocate(&feature_id, Feature::size_of() as u64),
-                    system_instruction::assign(&feature_id, &feature::id()),
-                ],
+                &feature::activate_with_lamports(
+                    &feature_id,
+                    &config.signers[0].pubkey(),
+                    lamports,
+                ),
                 Some(&config.signers[0].pubkey()),
             )
         },

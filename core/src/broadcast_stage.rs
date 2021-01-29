@@ -1,4 +1,5 @@
 //! A stage to broadcast data from a leader node to validators
+#![allow(clippy::rc_buffer)]
 use self::{
     broadcast_fake_shreds_run::BroadcastFakeShredsRun, broadcast_metrics::*,
     fail_entry_verification_broadcast_run::FailEntryVerificationBroadcastRun,
@@ -16,7 +17,7 @@ use crossbeam_channel::{
     Receiver as CrossbeamReceiver, RecvTimeoutError as CrossbeamRecvTimeoutError,
     Sender as CrossbeamSender,
 };
-use solana_ledger::{blockstore::Blockstore, shred::Shred, staking_utils};
+use solana_ledger::{blockstore::Blockstore, shred::Shred};
 use solana_measure::measure::Measure;
 use solana_metrics::{inc_new_counter_error, inc_new_counter_info};
 use solana_runtime::bank::Bank;
@@ -305,7 +306,7 @@ impl BroadcastStage {
 
         for (_, bank) in retransmit_slots.iter() {
             let bank_epoch = bank.get_leader_schedule_epoch(bank.slot());
-            let stakes = staking_utils::staked_nodes_at_epoch(&bank, bank_epoch);
+            let stakes = bank.epoch_staked_nodes(bank_epoch);
             let stakes = stakes.map(Arc::new);
             let data_shreds = Arc::new(
                 blockstore
@@ -346,7 +347,8 @@ fn update_peer_stats(
 ) {
     let now = timestamp();
     let last = last_datapoint_submit.load(Ordering::Relaxed);
-    if now - last > 1000
+    #[allow(deprecated)]
+    if now.saturating_sub(last) > 1000
         && last_datapoint_submit.compare_and_swap(last, now, Ordering::Relaxed) == last
     {
         datapoint_info!(
@@ -357,9 +359,9 @@ fn update_peer_stats(
     }
 }
 
-pub fn get_broadcast_peers<S: std::hash::BuildHasher>(
+pub fn get_broadcast_peers(
     cluster_info: &ClusterInfo,
-    stakes: Option<Arc<HashMap<Pubkey, u64, S>>>,
+    stakes: Option<&HashMap<Pubkey, u64>>,
 ) -> (Vec<ContactInfo>, Vec<(u64, usize)>) {
     use crate::cluster_info;
     let mut peers = cluster_info.tvu_peers();
@@ -445,7 +447,7 @@ pub mod test {
         entry::create_ticks,
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
         get_tmp_ledger_path,
-        shred::{max_ticks_per_n_shreds, Shredder, RECOMMENDED_FEC_RATE},
+        shred::{max_ticks_per_n_shreds, ProcessShredsStats, Shredder, RECOMMENDED_FEC_RATE},
     };
     use solana_runtime::bank::Bank;
     use solana_sdk::{
@@ -474,7 +476,8 @@ pub mod test {
         let shredder = Shredder::new(slot, 0, RECOMMENDED_FEC_RATE, keypair, 0, 0)
             .expect("Expected to create a new shredder");
 
-        let coding_shreds = shredder.data_shreds_to_coding_shreds(&data_shreds[0..]);
+        let coding_shreds = shredder
+            .data_shreds_to_coding_shreds(&data_shreds[0..], &mut ProcessShredsStats::default());
         (
             data_shreds.clone(),
             coding_shreds.clone(),
@@ -517,8 +520,10 @@ pub mod test {
 
     #[test]
     fn test_num_live_peers() {
-        let mut ci = ContactInfo::default();
-        ci.wallclock = std::u64::MAX;
+        let mut ci = ContactInfo {
+            wallclock: std::u64::MAX,
+            ..ContactInfo::default()
+        };
         assert_eq!(num_live_peers(&[ci.clone()]), 1);
         ci.wallclock = timestamp() - 1;
         assert_eq!(num_live_peers(&[ci.clone()]), 2);
@@ -662,8 +667,6 @@ pub mod test {
                 }
             }
 
-            sleep(Duration::from_millis(2000));
-
             trace!(
                 "[broadcast_ledger] max_tick_height: {}, start_tick_height: {}, ticks_per_slot: {}",
                 max_tick_height,
@@ -671,10 +674,17 @@ pub mod test {
                 ticks_per_slot,
             );
 
-            let blockstore = broadcast_service.blockstore;
-            let entries = blockstore
-                .get_slot_entries(slot, 0)
-                .expect("Expect entries to be present");
+            let mut entries = vec![];
+            for _ in 0..10 {
+                entries = broadcast_service
+                    .blockstore
+                    .get_slot_entries(slot, 0)
+                    .expect("Expect entries to be present");
+                if entries.len() >= max_tick_height as usize {
+                    break;
+                }
+                sleep(Duration::from_millis(1000));
+            }
             assert_eq!(entries.len(), max_tick_height as usize);
 
             drop(entry_sender);

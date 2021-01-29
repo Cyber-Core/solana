@@ -19,6 +19,7 @@ import {
   AccountBalanceRow,
 } from "components/common/Account";
 import { displayTimestamp } from "utils/date";
+import { Slot } from "components/common/Slot";
 
 export function SysvarAccountSection({
   account,
@@ -104,7 +105,7 @@ function SysvarAccountRecentBlockhashesCard({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Recent Blockhashes"
+        title="Sysvar: Recent Blockhashes"
         refresh={() => refresh(account.pubkey)}
       />
 
@@ -126,7 +127,7 @@ function SysvarAccountSlotHashes({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Slot Hashes"
+        title="Sysvar: Slot Hashes"
         refresh={() => refresh(account.pubkey)}
       />
 
@@ -155,7 +156,7 @@ function SysvarAccountSlotHistory({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Slot History"
+        title="Sysvar: Slot History"
         refresh={() => refresh(account.pubkey)}
       />
 
@@ -171,7 +172,7 @@ function SysvarAccountSlotHistory({
           <td className="text-lg-right text-monospace">
             {history.map((val) => (
               <p key={val} className="mb-0">
-                {val}
+                <Slot slot={val} link />
               </p>
             ))}
           </td>
@@ -191,7 +192,7 @@ function SysvarAccountStakeHistory({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Stake History"
+        title="Sysvar: Stake History"
         refresh={() => refresh(account.pubkey)}
       />
 
@@ -214,7 +215,7 @@ function SysvarAccountFeesCard({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Fees"
+        title="Sysvar: Fees"
         refresh={() => refresh(account.pubkey)}
       />
 
@@ -244,7 +245,7 @@ function SysvarAccountEpochScheduleCard({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Epoch Schedule"
+        title="Sysvar: Epoch Schedule"
         refresh={() => refresh(account.pubkey)}
       />
 
@@ -281,7 +282,7 @@ function SysvarAccountEpochScheduleCard({
         <tr>
           <td>First Normal Slot</td>
           <td className="text-lg-right">
-            {sysvarAccount.info.firstNormalSlot}
+            <Slot slot={sysvarAccount.info.firstNormalSlot} />
           </td>
         </tr>
       </TableCardBody>
@@ -300,7 +301,7 @@ function SysvarAccountClockCard({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Clock"
+        title="Sysvar: Clock"
         refresh={() => refresh(account.pubkey)}
       />
 
@@ -329,7 +330,9 @@ function SysvarAccountClockCard({
 
         <tr>
           <td>Slot</td>
-          <td className="text-lg-right">{sysvarAccount.info.slot}</td>
+          <td className="text-lg-right">
+            <Slot slot={sysvarAccount.info.slot} link />
+          </td>
         </tr>
       </TableCardBody>
     </div>
@@ -347,7 +350,7 @@ function SysvarAccountRentCard({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Rent"
+        title="Sysvar: Rent"
         refresh={() => refresh(account.pubkey)}
       />
 
@@ -396,7 +399,7 @@ function SysvarAccountRewardsCard({
   return (
     <div className="card">
       <AccountHeader
-        title="Sysvar Rewards"
+        title="Sysvar: Rewards"
         refresh={() => refresh(account.pubkey)}
       />
 

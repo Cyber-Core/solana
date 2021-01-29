@@ -10,6 +10,7 @@ import {
 import { slotsToHumanString } from "utils";
 import { useCluster } from "providers/cluster";
 import { TpsCard } from "components/TpsCard";
+import { displayTimestampUtc } from "utils/date";
 
 const CLUSTER_STATS_TIMEOUT = 10000;
 
@@ -52,9 +53,14 @@ function StatsCardBody() {
     return <StatsNotReady error={error} />;
   }
 
-  const { avgSlotTime_1h, avgSlotTime_1min, epochInfo } = dashboardInfo;
+  const {
+    avgSlotTime_1h,
+    avgSlotTime_1min,
+    epochInfo,
+    blockTime,
+  } = dashboardInfo;
   const hourlySlotTime = Math.round(1000 * avgSlotTime_1h);
-  const averageSlotTime = Math.round(1000 * avgSlotTime_1min) + "ms";
+  const averageSlotTime = Math.round(1000 * avgSlotTime_1min);
   const { slotIndex, slotsInEpoch } = epochInfo;
   const currentEpoch = epochInfo.epoch.toString();
   const epochProgress = ((100 * slotIndex) / slotsInEpoch).toFixed(1) + "%";
@@ -69,7 +75,7 @@ function StatsCardBody() {
       <tr>
         <td className="w-100">Slot</td>
         <td className="text-lg-right text-monospace">
-          <Slot slot={absoluteSlot} />
+          <Slot slot={absoluteSlot} link />
         </td>
       </tr>
       {blockHeight !== undefined && (
@@ -80,21 +86,33 @@ function StatsCardBody() {
           </td>
         </tr>
       )}
+      {blockTime && (
+        <tr>
+          <td className="w-100">Cluster time</td>
+          <td className="text-lg-right text-monospace">
+            {displayTimestampUtc(blockTime)}
+          </td>
+        </tr>
+      )}
       <tr>
-        <td className="w-100">Slot time</td>
-        <td className="text-lg-right text-monospace">{averageSlotTime}</td>
+        <td className="w-100">Slot time (1min average)</td>
+        <td className="text-lg-right text-monospace">{averageSlotTime}ms</td>
+      </tr>
+      <tr>
+        <td className="w-100">Slot time (1hr average)</td>
+        <td className="text-lg-right text-monospace">{hourlySlotTime}ms</td>
       </tr>
       <tr>
         <td className="w-100">Epoch</td>
-        <td className="text-lg-right text-monospace">{currentEpoch} </td>
+        <td className="text-lg-right text-monospace">{currentEpoch}</td>
       </tr>
       <tr>
         <td className="w-100">Epoch progress</td>
-        <td className="text-lg-right text-monospace">{epochProgress} </td>
+        <td className="text-lg-right text-monospace">{epochProgress}</td>
       </tr>
       <tr>
-        <td className="w-100">Epoch time remaining</td>
-        <td className="text-lg-right text-monospace">{epochTimeRemaining} </td>
+        <td className="w-100">Epoch time remaining (approx.)</td>
+        <td className="text-lg-right text-monospace">~{epochTimeRemaining}</td>
       </tr>
     </TableCardBody>
   );

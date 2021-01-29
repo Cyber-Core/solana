@@ -17,40 +17,64 @@ use solana_client::{
     rpc_filter::RpcFilterType,
     rpc_response::{
         ProcessedSignatureResult, ReceivedSignatureResult, Response, RpcKeyedAccount,
-        RpcResponseContext, RpcSignatureResult, SlotInfo,
+        RpcLogsResponse, RpcResponseContext, RpcSignatureResult, SlotInfo,
     },
 };
 use solana_measure::measure::Measure;
 use solana_runtime::{
-    bank::Bank,
+    bank::{
+        Bank, TransactionLogCollectorConfig, TransactionLogCollectorFilter, TransactionLogInfo,
+    },
     bank_forks::BankForks,
     commitment::{BlockCommitmentCache, CommitmentSlots},
 };
 use solana_sdk::{
     account::Account,
     clock::{Slot, UnixTimestamp},
-    commitment_config::{CommitmentConfig, CommitmentLevel},
+    commitment_config::CommitmentConfig,
     pubkey::Pubkey,
     signature::Signature,
     transaction,
 };
 use solana_vote_program::vote_state::Vote;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, RecvTimeoutError, SendError, Sender},
-};
-use std::thread::{Builder, JoinHandle};
-use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     iter,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SendError, Sender},
+    },
     sync::{Arc, Mutex, RwLock},
+    thread::{Builder, JoinHandle},
+    time::Duration,
 };
 
 // Stuck on tokio 0.1 until the jsonrpc-pubsub crate upgrades to tokio 0.2
 use tokio_01::runtime::{Builder as RuntimeBuilder, Runtime, TaskExecutor};
 
 const RECEIVE_DELAY_MILLIS: u64 = 100;
+
+trait BankGetTransactionLogsAdapter {
+    fn get_transaction_logs_adapter(
+        &self,
+        stuff: &(Option<Pubkey>, bool),
+    ) -> Option<Vec<TransactionLogInfo>>;
+}
+
+impl BankGetTransactionLogsAdapter for Bank {
+    fn get_transaction_logs_adapter(
+        &self,
+        config: &(Option<Pubkey>, bool),
+    ) -> Option<Vec<TransactionLogInfo>> {
+        let mut logs = self.get_transaction_logs(config.0.as_ref());
+
+        if config.0.is_none() && !config.1 {
+            // Filter out votes if the subscriber doesn't want them
+            logs = logs.map(|logs| logs.into_iter().filter(|log| !log.is_vote).collect());
+        }
+        logs
+    }
+}
 
 // A more human-friendly version of Vote, with the bank state signature base58 encoded.
 #[derive(Serialize, Deserialize, Debug)]
@@ -103,6 +127,12 @@ type RpcAccountSubscriptions = RwLock<
         HashMap<SubscriptionId, SubscriptionData<Response<UiAccount>, UiAccountEncoding>>,
     >,
 >;
+type RpcLogsSubscriptions = RwLock<
+    HashMap<
+        (Option<Pubkey>, bool),
+        HashMap<SubscriptionId, SubscriptionData<Response<RpcLogsResponse>, ()>>,
+    >,
+>;
 type RpcProgramSubscriptions = RwLock<
     HashMap<
         Pubkey,
@@ -122,7 +152,7 @@ type RpcRootSubscriptions = RwLock<HashMap<SubscriptionId, Sink<Slot>>>;
 fn add_subscription<K, S, T>(
     subscriptions: &mut HashMap<K, HashMap<SubscriptionId, SubscriptionData<S, T>>>,
     hashmap_key: K,
-    commitment: Option<CommitmentConfig>,
+    commitment: CommitmentConfig,
     sub_id: SubscriptionId,
     subscriber: Subscriber<S>,
     last_notified_slot: Slot,
@@ -132,7 +162,6 @@ fn add_subscription<K, S, T>(
     S: Clone,
 {
     let sink = subscriber.assign_id(sub_id.clone()).unwrap();
-    let commitment = commitment.unwrap_or_else(CommitmentConfig::single);
     let subscription_data = SubscriptionData {
         sink,
         commitment,
@@ -182,8 +211,8 @@ where
     K: Eq + Hash + Clone + Copy,
     S: Clone + Serialize,
     B: Fn(&Bank, &K) -> X,
-    F: Fn(X, &K, Slot, Option<T>, Option<Arc<Bank>>) -> (Box<dyn Iterator<Item = S>>, Slot),
-    X: Clone + Serialize + Default,
+    F: Fn(X, &K, Slot, Option<T>, Arc<Bank>) -> (Box<dyn Iterator<Item = S>>, Slot),
+    X: Clone + Default,
     T: Clone,
 {
     let mut notified_set: HashSet<SubscriptionId> = HashSet::new();
@@ -198,37 +227,35 @@ where
             },
         ) in hashmap.iter()
         {
-            let slot = match commitment.commitment {
-                CommitmentLevel::Max => commitment_slots.highest_confirmed_root,
-                CommitmentLevel::Recent => commitment_slots.slot,
-                CommitmentLevel::Root => commitment_slots.root,
-                CommitmentLevel::Single | CommitmentLevel::SingleGossip => {
-                    commitment_slots.highest_confirmed_slot
-                }
+            let slot = if commitment.is_finalized() {
+                commitment_slots.highest_confirmed_root
+            } else if commitment.is_confirmed() {
+                commitment_slots.highest_confirmed_slot
+            } else {
+                commitment_slots.slot
             };
-            let bank = bank_forks.read().unwrap().get(slot).cloned();
-            let results = bank
-                .clone()
-                .map(|desired_bank| bank_method(&desired_bank, hashmap_key))
-                .unwrap_or_default();
-            let mut w_last_notified_slot = last_notified_slot.write().unwrap();
-            let (filter_results, result_slot) = filter_results(
-                results,
-                hashmap_key,
-                *w_last_notified_slot,
-                config.as_ref().cloned(),
-                bank,
-            );
-            for result in filter_results {
-                notifier.notify(
-                    Response {
-                        context: RpcResponseContext { slot },
-                        value: result,
-                    },
-                    sink,
+
+            if let Some(bank) = bank_forks.read().unwrap().get(slot).cloned() {
+                let results = bank_method(&bank, hashmap_key);
+                let mut w_last_notified_slot = last_notified_slot.write().unwrap();
+                let (filter_results, result_slot) = filter_results(
+                    results,
+                    hashmap_key,
+                    *w_last_notified_slot,
+                    config.as_ref().cloned(),
+                    bank,
                 );
-                notified_set.insert(sub_id.clone());
-                *w_last_notified_slot = result_slot;
+                for result in filter_results {
+                    notifier.notify(
+                        Response {
+                            context: RpcResponseContext { slot },
+                            value: result,
+                        },
+                        sink,
+                    );
+                    notified_set.insert(sub_id.clone());
+                    *w_last_notified_slot = result_slot;
+                }
             }
         }
     }
@@ -252,30 +279,28 @@ fn filter_account_result(
     pubkey: &Pubkey,
     last_notified_slot: Slot,
     encoding: Option<UiAccountEncoding>,
-    bank: Option<Arc<Bank>>,
+    bank: Arc<Bank>,
 ) -> (Box<dyn Iterator<Item = UiAccount>>, Slot) {
-    if let Some((account, fork)) = result {
-        // If fork < last_notified_slot this means that we last notified for a fork
-        // and should notify that the account state has been reverted.
-        if fork != last_notified_slot {
-            let encoding = encoding.unwrap_or(UiAccountEncoding::Binary);
-            if account.owner == spl_token_id_v2_0() && encoding == UiAccountEncoding::JsonParsed {
-                let bank = bank.unwrap(); // If result.is_some(), bank must also be Some
-                return (
-                    Box::new(iter::once(get_parsed_token_account(bank, pubkey, account))),
-                    fork,
-                );
-            } else {
-                return (
-                    Box::new(iter::once(UiAccount::encode(
-                        pubkey, account, encoding, None, None,
-                    ))),
-                    fork,
-                );
-            }
+    // If the account is not found, `last_modified_slot` will default to zero and
+    // we will notify clients that the account no longer exists if we haven't already
+    let (account, last_modified_slot) = result.unwrap_or_default();
+
+    // If last_modified_slot < last_notified_slot this means that we last notified for a fork
+    // and should notify that the account state has been reverted.
+    let results: Box<dyn Iterator<Item = UiAccount>> = if last_modified_slot != last_notified_slot {
+        let encoding = encoding.unwrap_or(UiAccountEncoding::Binary);
+        if account.owner == spl_token_id_v2_0() && encoding == UiAccountEncoding::JsonParsed {
+            Box::new(iter::once(get_parsed_token_account(bank, pubkey, account)))
+        } else {
+            Box::new(iter::once(UiAccount::encode(
+                pubkey, account, encoding, None, None,
+            )))
         }
-    }
-    (Box::new(iter::empty()), last_notified_slot)
+    } else {
+        Box::new(iter::empty())
+    };
+
+    (results, last_modified_slot)
 }
 
 fn filter_signature_result(
@@ -283,7 +308,7 @@ fn filter_signature_result(
     _signature: &Signature,
     last_notified_slot: Slot,
     _config: Option<bool>,
-    _bank: Option<Arc<Bank>>,
+    _bank: Arc<Bank>,
 ) -> (Box<dyn Iterator<Item = RpcSignatureResult>>, Slot) {
     (
         Box::new(result.into_iter().map(|result| {
@@ -298,7 +323,7 @@ fn filter_program_results(
     program_id: &Pubkey,
     last_notified_slot: Slot,
     config: Option<ProgramConfig>,
-    bank: Option<Arc<Bank>>,
+    bank: Arc<Bank>,
 ) -> (Box<dyn Iterator<Item = RpcKeyedAccount>>, Slot) {
     let config = config.unwrap_or_default();
     let encoding = config.encoding.unwrap_or(UiAccountEncoding::Binary);
@@ -314,7 +339,6 @@ fn filter_program_results(
         && encoding == UiAccountEncoding::JsonParsed
         && !accounts_is_empty
     {
-        let bank = bank.unwrap(); // If !accounts_is_empty, bank must be Some
         Box::new(get_parsed_token_accounts(bank, keyed_accounts))
     } else {
         Box::new(
@@ -327,17 +351,67 @@ fn filter_program_results(
     (accounts, last_notified_slot)
 }
 
+fn filter_logs_results(
+    logs: Option<Vec<TransactionLogInfo>>,
+    _address: &(Option<Pubkey>, bool),
+    last_notified_slot: Slot,
+    _config: Option<()>,
+    _bank: Arc<Bank>,
+) -> (Box<dyn Iterator<Item = RpcLogsResponse>>, Slot) {
+    match logs {
+        None => (Box::new(iter::empty()), last_notified_slot),
+        Some(logs) => (
+            Box::new(logs.into_iter().map(|log| RpcLogsResponse {
+                signature: log.signature.to_string(),
+                err: log.result.err(),
+                logs: log.log_messages,
+            })),
+            last_notified_slot,
+        ),
+    }
+}
+
+fn total_nested_subscriptions<K, L, V>(
+    subscription_map: &RwLock<HashMap<K, HashMap<L, V>>>,
+) -> usize {
+    subscription_map
+        .read()
+        .unwrap()
+        .iter()
+        .fold(0, |acc, x| acc + x.1.len())
+}
+
 #[derive(Clone)]
 struct Subscriptions {
     account_subscriptions: Arc<RpcAccountSubscriptions>,
     program_subscriptions: Arc<RpcProgramSubscriptions>,
+    logs_subscriptions: Arc<RpcLogsSubscriptions>,
     signature_subscriptions: Arc<RpcSignatureSubscriptions>,
     gossip_account_subscriptions: Arc<RpcAccountSubscriptions>,
+    gossip_logs_subscriptions: Arc<RpcLogsSubscriptions>,
     gossip_program_subscriptions: Arc<RpcProgramSubscriptions>,
     gossip_signature_subscriptions: Arc<RpcSignatureSubscriptions>,
     slot_subscriptions: Arc<RpcSlotSubscriptions>,
     vote_subscriptions: Arc<RpcVoteSubscriptions>,
     root_subscriptions: Arc<RpcRootSubscriptions>,
+}
+
+impl Subscriptions {
+    fn total(&self) -> usize {
+        let mut total = 0;
+        total += total_nested_subscriptions(&self.account_subscriptions);
+        total += total_nested_subscriptions(&self.program_subscriptions);
+        total += total_nested_subscriptions(&self.logs_subscriptions);
+        total += total_nested_subscriptions(&self.signature_subscriptions);
+        total += total_nested_subscriptions(&self.gossip_account_subscriptions);
+        total += total_nested_subscriptions(&self.gossip_logs_subscriptions);
+        total += total_nested_subscriptions(&self.gossip_program_subscriptions);
+        total += total_nested_subscriptions(&self.gossip_signature_subscriptions);
+        total += self.slot_subscriptions.read().unwrap().len();
+        total += self.vote_subscriptions.read().unwrap().len();
+        total += self.root_subscriptions.read().unwrap().len();
+        total
+    }
 }
 
 pub struct RpcSubscriptions {
@@ -349,6 +423,7 @@ pub struct RpcSubscriptions {
     block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
     optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
     exit: Arc<AtomicBool>,
+    enable_vote_subscription: bool,
 }
 
 impl Drop for RpcSubscriptions {
@@ -366,15 +441,33 @@ impl RpcSubscriptions {
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
     ) -> Self {
+        Self::new_with_vote_subscription(
+            exit,
+            bank_forks,
+            block_commitment_cache,
+            optimistically_confirmed_bank,
+            false,
+        )
+    }
+
+    pub fn new_with_vote_subscription(
+        exit: &Arc<AtomicBool>,
+        bank_forks: Arc<RwLock<BankForks>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        enable_vote_subscription: bool,
+    ) -> Self {
         let (notification_sender, notification_receiver): (
             Sender<NotificationEntry>,
             Receiver<NotificationEntry>,
         ) = std::sync::mpsc::channel();
 
         let account_subscriptions = Arc::new(RpcAccountSubscriptions::default());
+        let logs_subscriptions = Arc::new(RpcLogsSubscriptions::default());
         let program_subscriptions = Arc::new(RpcProgramSubscriptions::default());
         let signature_subscriptions = Arc::new(RpcSignatureSubscriptions::default());
         let gossip_account_subscriptions = Arc::new(RpcAccountSubscriptions::default());
+        let gossip_logs_subscriptions = Arc::new(RpcLogsSubscriptions::default());
         let gossip_program_subscriptions = Arc::new(RpcProgramSubscriptions::default());
         let gossip_signature_subscriptions = Arc::new(RpcSignatureSubscriptions::default());
         let slot_subscriptions = Arc::new(RpcSlotSubscriptions::default());
@@ -387,9 +480,11 @@ impl RpcSubscriptions {
         let exit_clone = exit.clone();
         let subscriptions = Subscriptions {
             account_subscriptions,
+            logs_subscriptions,
             program_subscriptions,
             signature_subscriptions,
             gossip_account_subscriptions,
+            gossip_logs_subscriptions,
             gossip_program_subscriptions,
             gossip_signature_subscriptions,
             slot_subscriptions,
@@ -427,17 +522,20 @@ impl RpcSubscriptions {
             block_commitment_cache,
             optimistically_confirmed_bank,
             exit: exit.clone(),
+            enable_vote_subscription,
         }
     }
 
+    // For tests only...
     pub fn default_with_bank_forks(bank_forks: Arc<RwLock<BankForks>>) -> Self {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        Self::new(
+        Self::new_with_vote_subscription(
             &Arc::new(AtomicBool::new(false)),
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
             optimistically_confirmed_bank,
+            true,
         )
     }
 
@@ -456,6 +554,25 @@ impl RpcSubscriptions {
             commitment_slots,
             Bank::get_account_modified_slot,
             filter_account_result,
+            notifier,
+        )
+    }
+
+    fn check_logs(
+        address_with_enable_votes_flag: &(Option<Pubkey>, bool),
+        bank_forks: &Arc<RwLock<BankForks>>,
+        logs_subscriptions: Arc<RpcLogsSubscriptions>,
+        notifier: &RpcNotifier,
+        commitment_slots: &CommitmentSlots,
+    ) -> HashSet<SubscriptionId> {
+        let subscriptions = logs_subscriptions.read().unwrap();
+        check_commitment_and_notify(
+            &subscriptions,
+            address_with_enable_votes_flag,
+            bank_forks,
+            commitment_slots,
+            Bank::get_transaction_logs_adapter,
+            filter_logs_results,
             notifier,
         )
     }
@@ -505,6 +622,10 @@ impl RpcSubscriptions {
         notified_ids
     }
 
+    pub fn total(&self) -> usize {
+        self.subscriptions.total()
+    }
+
     pub fn add_account_subscription(
         &self,
         pubkey: Pubkey,
@@ -513,30 +634,25 @@ impl RpcSubscriptions {
         subscriber: Subscriber<Response<UiAccount>>,
     ) {
         let config = config.unwrap_or_default();
-        let commitment_level = config
+        let commitment = config
             .commitment
-            .unwrap_or_else(CommitmentConfig::single)
-            .commitment;
-        let slot = match commitment_level {
-            CommitmentLevel::Max => self
-                .block_commitment_cache
+            .unwrap_or_else(CommitmentConfig::confirmed);
+
+        let slot = if commitment.is_finalized() {
+            self.block_commitment_cache
                 .read()
                 .unwrap()
-                .highest_confirmed_root(),
-            CommitmentLevel::Recent => self.block_commitment_cache.read().unwrap().slot(),
-            CommitmentLevel::Root => self.block_commitment_cache.read().unwrap().root(),
-            CommitmentLevel::Single => self
-                .block_commitment_cache
-                .read()
-                .unwrap()
-                .highest_confirmed_slot(),
-            CommitmentLevel::SingleGossip => self
-                .optimistically_confirmed_bank
+                .highest_confirmed_root()
+        } else if commitment.is_confirmed() {
+            self.optimistically_confirmed_bank
                 .read()
                 .unwrap()
                 .bank
-                .slot(),
+                .slot()
+        } else {
+            self.block_commitment_cache.read().unwrap().slot()
         };
+
         let last_notified_slot = if let Some((_account, slot)) = self
             .bank_forks
             .read()
@@ -549,7 +665,7 @@ impl RpcSubscriptions {
             0
         };
 
-        let mut subscriptions = if commitment_level == CommitmentLevel::SingleGossip {
+        let mut subscriptions = if commitment.is_confirmed() {
             self.subscriptions
                 .gossip_account_subscriptions
                 .write()
@@ -557,10 +673,11 @@ impl RpcSubscriptions {
         } else {
             self.subscriptions.account_subscriptions.write().unwrap()
         };
+
         add_subscription(
             &mut subscriptions,
             pubkey,
-            config.commitment,
+            commitment,
             sub_id,
             subscriber,
             last_notified_slot,
@@ -590,12 +707,12 @@ impl RpcSubscriptions {
         subscriber: Subscriber<Response<RpcKeyedAccount>>,
     ) {
         let config = config.unwrap_or_default();
-        let commitment_level = config
+        let commitment = config
             .account_config
             .commitment
-            .unwrap_or_else(CommitmentConfig::recent)
-            .commitment;
-        let mut subscriptions = if commitment_level == CommitmentLevel::SingleGossip {
+            .unwrap_or_else(CommitmentConfig::confirmed);
+
+        let mut subscriptions = if commitment.is_confirmed() {
             self.subscriptions
                 .gossip_program_subscriptions
                 .write()
@@ -603,10 +720,11 @@ impl RpcSubscriptions {
         } else {
             self.subscriptions.program_subscriptions.write().unwrap()
         };
+
         add_subscription(
             &mut subscriptions,
             program_id,
-            config.account_config.commitment,
+            commitment,
             sub_id,
             subscriber,
             0, // last_notified_slot is not utilized for program subscriptions
@@ -631,6 +749,114 @@ impl RpcSubscriptions {
         }
     }
 
+    pub fn add_logs_subscription(
+        &self,
+        address: Option<Pubkey>,
+        include_votes: bool,
+        commitment: Option<CommitmentConfig>,
+        sub_id: SubscriptionId,
+        subscriber: Subscriber<Response<RpcLogsResponse>>,
+    ) {
+        let commitment = commitment.unwrap_or_else(CommitmentConfig::confirmed);
+
+        {
+            let mut subscriptions = if commitment.is_confirmed() {
+                self.subscriptions
+                    .gossip_logs_subscriptions
+                    .write()
+                    .unwrap()
+            } else {
+                self.subscriptions.logs_subscriptions.write().unwrap()
+            };
+            add_subscription(
+                &mut subscriptions,
+                (address, include_votes),
+                commitment,
+                sub_id,
+                subscriber,
+                0, // last_notified_slot is not utilized for logs subscriptions
+                None,
+            );
+        }
+        self.update_bank_transaction_log_keys();
+    }
+
+    pub fn remove_logs_subscription(&self, id: &SubscriptionId) -> bool {
+        let mut removed = {
+            let mut subscriptions = self.subscriptions.logs_subscriptions.write().unwrap();
+            remove_subscription(&mut subscriptions, id)
+        };
+
+        if !removed {
+            removed = {
+                let mut subscriptions = self
+                    .subscriptions
+                    .gossip_logs_subscriptions
+                    .write()
+                    .unwrap();
+                remove_subscription(&mut subscriptions, id)
+            };
+        }
+
+        if removed {
+            self.update_bank_transaction_log_keys();
+        }
+        removed
+    }
+
+    fn update_bank_transaction_log_keys(&self) {
+        // Grab a write lock for both `logs_subscriptions` and `gossip_logs_subscriptions`, to
+        // ensure `Bank::transaction_log_collector_config` is updated atomically.
+        let logs_subscriptions = self.subscriptions.logs_subscriptions.write().unwrap();
+        let gossip_logs_subscriptions = self
+            .subscriptions
+            .gossip_logs_subscriptions
+            .write()
+            .unwrap();
+
+        let mut config = TransactionLogCollectorConfig::default();
+
+        let mut all = false;
+        let mut all_with_votes = false;
+        let mut mentioned_address = false;
+        for (address, with_votes) in logs_subscriptions
+            .keys()
+            .chain(gossip_logs_subscriptions.keys())
+        {
+            match address {
+                None => {
+                    if *with_votes {
+                        all_with_votes = true;
+                    } else {
+                        all = true;
+                    }
+                }
+                Some(address) => {
+                    config.mentioned_addresses.insert(*address);
+                    mentioned_address = true;
+                }
+            }
+        }
+        config.filter = if all_with_votes {
+            TransactionLogCollectorFilter::AllWithVotes
+        } else if all {
+            TransactionLogCollectorFilter::All
+        } else if mentioned_address {
+            TransactionLogCollectorFilter::OnlyMentionedAddresses
+        } else {
+            TransactionLogCollectorFilter::None
+        };
+
+        *self
+            .bank_forks
+            .read()
+            .unwrap()
+            .root_bank()
+            .transaction_log_collector_config
+            .write()
+            .unwrap() = config;
+    }
+
     pub fn add_signature_subscription(
         &self,
         signature: Signature,
@@ -642,11 +868,9 @@ impl RpcSubscriptions {
             .map(|config| (config.commitment, config.enable_received_notification))
             .unwrap_or_default();
 
-        let commitment_level = commitment
-            .unwrap_or_else(CommitmentConfig::recent)
-            .commitment;
+        let commitment = commitment.unwrap_or_else(CommitmentConfig::confirmed);
 
-        let mut subscriptions = if commitment_level == CommitmentLevel::SingleGossip {
+        let mut subscriptions = if commitment.is_confirmed() {
             self.subscriptions
                 .gossip_signature_subscriptions
                 .write()
@@ -654,6 +878,7 @@ impl RpcSubscriptions {
         } else {
             self.subscriptions.signature_subscriptions.write().unwrap()
         };
+
         add_subscription(
             &mut subscriptions,
             signature,
@@ -685,7 +910,7 @@ impl RpcSubscriptions {
         self.enqueue_notification(NotificationEntry::Bank(commitment_slots));
     }
 
-    /// Notify SingleGossip commitment-level subscribers of changes to any accounts or new
+    /// Notify Confirmed commitment-level subscribers of changes to any accounts or new
     /// signatures.
     pub fn notify_gossip_subscribers(&self, slot: Slot) {
         self.enqueue_notification(NotificationEntry::Gossip(slot));
@@ -711,9 +936,15 @@ impl RpcSubscriptions {
     }
 
     pub fn add_vote_subscription(&self, sub_id: SubscriptionId, subscriber: Subscriber<RpcVote>) {
-        let sink = subscriber.assign_id(sub_id.clone()).unwrap();
-        let mut subscriptions = self.subscriptions.vote_subscriptions.write().unwrap();
-        subscriptions.insert(sub_id, sink);
+        if self.enable_vote_subscription {
+            let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+            let mut subscriptions = self.subscriptions.vote_subscriptions.write().unwrap();
+            subscriptions.insert(sub_id, sink);
+        } else {
+            let _ = subscriber.reject(jsonrpc_core::Error::new(
+                jsonrpc_core::ErrorCode::MethodNotFound,
+            ));
+        }
     }
 
     pub fn remove_vote_subscription(&self, id: &SubscriptionId) -> bool {
@@ -737,7 +968,7 @@ impl RpcSubscriptions {
     }
 
     pub fn notify_roots(&self, mut rooted_slots: Vec<Slot>) {
-        rooted_slots.sort();
+        rooted_slots.sort_unstable();
         rooted_slots.into_iter().for_each(|root| {
             self.enqueue_notification(NotificationEntry::Root(root));
         });
@@ -774,9 +1005,16 @@ impl RpcSubscriptions {
             match notification_receiver.recv_timeout(Duration::from_millis(RECEIVE_DELAY_MILLIS)) {
                 Ok(notification_entry) => match notification_entry {
                     NotificationEntry::Slot(slot_info) => {
-                        debug!("slot notify: {:?}", slot_info);
                         let subscriptions = subscriptions.slot_subscriptions.read().unwrap();
+                        let num_subscriptions = subscriptions.len();
+                        if num_subscriptions > 0 {
+                            debug!(
+                                "slot notify: {:?}, num_subscriptions: {:?}",
+                                slot_info, num_subscriptions
+                            );
+                        }
                         for (_, sink) in subscriptions.iter() {
+                            inc_new_counter_info!("rpc-subscription-notify-slot", 1);
                             notifier.notify(slot_info, sink);
                         }
                     }
@@ -784,9 +1022,16 @@ impl RpcSubscriptions {
                     // unlike `NotificationEntry::Gossip`, which also accounts for slots seen
                     // in VoteState's from bank states built in ReplayStage.
                     NotificationEntry::Vote(ref vote_info) => {
-                        debug!("vote notify: {:?}", vote_info);
                         let subscriptions = subscriptions.vote_subscriptions.read().unwrap();
+                        let num_subscriptions = subscriptions.len();
+                        if num_subscriptions > 0 {
+                            debug!(
+                                "vote notify: {:?}, num_subscriptions: {:?}",
+                                vote_info, num_subscriptions
+                            );
+                        }
                         for (_, sink) in subscriptions.iter() {
+                            inc_new_counter_info!("rpc-subscription-notify-vote", 1);
                             notifier.notify(
                                 RpcVote {
                                     slots: vote_info.slots.clone(),
@@ -798,15 +1043,23 @@ impl RpcSubscriptions {
                         }
                     }
                     NotificationEntry::Root(root) => {
-                        debug!("root notify: {:?}", root);
                         let subscriptions = subscriptions.root_subscriptions.read().unwrap();
+                        let num_subscriptions = subscriptions.len();
+                        if num_subscriptions > 0 {
+                            debug!(
+                                "root notify: {:?}, num_subscriptions: {:?}",
+                                root, num_subscriptions
+                            );
+                        }
                         for (_, sink) in subscriptions.iter() {
+                            inc_new_counter_info!("rpc-subscription-notify-root", 1);
                             notifier.notify(root, sink);
                         }
                     }
                     NotificationEntry::Bank(commitment_slots) => {
-                        RpcSubscriptions::notify_accounts_programs_signatures(
+                        RpcSubscriptions::notify_accounts_logs_programs_signatures(
                             &subscriptions.account_subscriptions,
+                            &subscriptions.logs_subscriptions,
                             &subscriptions.program_subscriptions,
                             &subscriptions.signature_subscriptions,
                             &bank_forks,
@@ -852,8 +1105,9 @@ impl RpcSubscriptions {
             highest_confirmed_slot: slot,
             ..CommitmentSlots::default()
         };
-        RpcSubscriptions::notify_accounts_programs_signatures(
+        RpcSubscriptions::notify_accounts_logs_programs_signatures(
             &subscriptions.gossip_account_subscriptions,
+            &subscriptions.gossip_logs_subscriptions,
             &subscriptions.gossip_program_subscriptions,
             &subscriptions.gossip_signature_subscriptions,
             bank_forks,
@@ -863,8 +1117,9 @@ impl RpcSubscriptions {
         );
     }
 
-    fn notify_accounts_programs_signatures(
+    fn notify_accounts_logs_programs_signatures(
         account_subscriptions: &Arc<RpcAccountSubscriptions>,
+        logs_subscriptions: &Arc<RpcLogsSubscriptions>,
         program_subscriptions: &Arc<RpcProgramSubscriptions>,
         signature_subscriptions: &Arc<RpcSignatureSubscriptions>,
         bank_forks: &Arc<RwLock<BankForks>>,
@@ -889,6 +1144,24 @@ impl RpcSubscriptions {
             .len();
         }
         accounts_time.stop();
+
+        let mut logs_time = Measure::start("logs");
+        let logs: Vec<_> = {
+            let subs = logs_subscriptions.read().unwrap();
+            subs.keys().cloned().collect()
+        };
+        let mut num_logs_notified = 0;
+        for address in &logs {
+            num_logs_notified += Self::check_logs(
+                address,
+                bank_forks,
+                logs_subscriptions.clone(),
+                &notifier,
+                &commitment_slots,
+            )
+            .len();
+        }
+        logs_time.stop();
 
         let mut programs_time = Measure::start("programs");
         let programs: Vec<_> = {
@@ -940,6 +1213,23 @@ impl RpcSubscriptions {
                 signatures.len(),
                 num_signatures_notified,
                 signatures_time,
+            );
+            inc_new_counter_info!("rpc-subscription-notify-bank-or-gossip", total_notified);
+            datapoint_info!(
+                "rpc_subscriptions",
+                ("source", source.to_string(), String),
+                ("num_account_subscriptions", pubkeys.len(), i64),
+                ("num_account_pubkeys_notified", num_pubkeys_notified, i64),
+                ("accounts_time", accounts_time.as_us() as i64, i64),
+                ("num_logs_subscriptions", logs.len(), i64),
+                ("num_logs_notified", num_logs_notified, i64),
+                ("logs_time", logs_time.as_us() as i64, i64),
+                ("num_program_subscriptions", programs.len(), i64),
+                ("num_programs_notified", num_programs_notified, i64),
+                ("programs_time", programs_time.as_us() as i64, i64),
+                ("num_signature_subscriptions", signatures.len(), i64),
+                ("num_signatures_notified", num_signatures_notified, i64),
+                ("signatures_time", signatures_time.as_us() as i64, i64)
             );
         }
     }
@@ -1006,14 +1296,16 @@ pub(crate) mod tests {
     };
     use jsonrpc_core::futures::{self, stream::Stream};
     use jsonrpc_pubsub::typed::Subscriber;
-    use serial_test_derive::serial;
+    use serial_test::serial;
     use solana_runtime::{
         commitment::BlockCommitment,
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
     };
     use solana_sdk::{
+        message::Message,
         signature::{Keypair, Signer},
-        system_transaction,
+        system_instruction, system_program, system_transaction,
+        transaction::Transaction,
     };
     use std::{fmt::Debug, sync::mpsc::channel, time::Instant};
     use tokio_01::{prelude::FutureExt, runtime::Runtime, timer::Delay};
@@ -1059,9 +1351,12 @@ pub(crate) mod tests {
         bank_forks.write().unwrap().insert(bank1);
         let alice = Keypair::new();
 
-        let (subscriber, _id_receiver, transport_receiver) =
-            Subscriber::new_test("accountNotification");
-        let sub_id = SubscriptionId::Number(0 as u64);
+        let (create_sub, _id_receiver, create_recv) = Subscriber::new_test("accountNotification");
+        let (close_sub, _id_receiver, close_recv) = Subscriber::new_test("accountNotification");
+
+        let create_sub_id = SubscriptionId::Number(0);
+        let close_sub_id = SubscriptionId::Number(1);
+
         let exit = Arc::new(AtomicBool::new(false));
         let subscriptions = RpcSubscriptions::new(
             &exit,
@@ -1074,12 +1369,12 @@ pub(crate) mod tests {
         subscriptions.add_account_subscription(
             alice.pubkey(),
             Some(RpcAccountInfoConfig {
-                commitment: Some(CommitmentConfig::recent()),
+                commitment: Some(CommitmentConfig::processed()),
                 encoding: None,
                 data_slice: None,
             }),
-            sub_id.clone(),
-            subscriber,
+            create_sub_id.clone(),
+            create_sub,
         );
 
         assert!(subscriptions
@@ -1094,8 +1389,8 @@ pub(crate) mod tests {
             &alice,
             blockhash,
             1,
-            16,
-            &solana_stake_program::id(),
+            0,
+            &system_program::id(),
         );
         bank_forks
             .write()
@@ -1104,10 +1399,12 @@ pub(crate) mod tests {
             .unwrap()
             .process_transaction(&tx)
             .unwrap();
-        let mut commitment_slots = CommitmentSlots::default();
-        commitment_slots.slot = 1;
+        let commitment_slots = CommitmentSlots {
+            slot: 1,
+            ..CommitmentSlots::default()
+        };
         subscriptions.notify_subscribers(commitment_slots);
-        let (response, _) = robust_poll_or_panic(transport_receiver);
+        let (response, _) = robust_poll_or_panic(create_recv);
         let expected = json!({
            "jsonrpc": "2.0",
            "method": "accountNotification",
@@ -1115,10 +1412,10 @@ pub(crate) mod tests {
                "result": {
                    "context": { "slot": 1 },
                    "value": {
-                       "data": "1111111111111111",
+                       "data": "",
                        "executable": false,
                        "lamports": 1,
-                       "owner": "Stake11111111111111111111111111111111111111",
+                       "owner": "11111111111111111111111111111111",
                        "rentEpoch": 0,
                     },
                },
@@ -1126,8 +1423,55 @@ pub(crate) mod tests {
            }
         });
         assert_eq!(serde_json::to_string(&expected).unwrap(), response);
+        subscriptions.remove_account_subscription(&create_sub_id);
 
-        subscriptions.remove_account_subscription(&sub_id);
+        subscriptions.add_account_subscription(
+            alice.pubkey(),
+            Some(RpcAccountInfoConfig {
+                commitment: Some(CommitmentConfig::processed()),
+                encoding: None,
+                data_slice: None,
+            }),
+            close_sub_id.clone(),
+            close_sub,
+        );
+
+        let tx = {
+            let instruction =
+                system_instruction::transfer(&alice.pubkey(), &mint_keypair.pubkey(), 1);
+            let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
+            Transaction::new(&[&alice, &mint_keypair], message, blockhash)
+        };
+
+        bank_forks
+            .write()
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .process_transaction(&tx)
+            .unwrap();
+        subscriptions.notify_subscribers(commitment_slots);
+        let (response, _) = robust_poll_or_panic(close_recv);
+        let expected = json!({
+           "jsonrpc": "2.0",
+           "method": "accountNotification",
+           "params": {
+               "result": {
+                   "context": { "slot": 1 },
+                   "value": {
+                       "data": "",
+                       "executable": false,
+                       "lamports": 0,
+                       "owner": "11111111111111111111111111111111",
+                       "rentEpoch": 0,
+                    },
+               },
+               "subscription": 1,
+           }
+        });
+        assert_eq!(serde_json::to_string(&expected).unwrap(), response);
+        subscriptions.remove_account_subscription(&close_sub_id);
+
         assert!(!subscriptions
             .subscriptions
             .account_subscriptions
@@ -1166,7 +1510,7 @@ pub(crate) mod tests {
 
         let (subscriber, _id_receiver, transport_receiver) =
             Subscriber::new_test("programNotification");
-        let sub_id = SubscriptionId::Number(0 as u64);
+        let sub_id = SubscriptionId::Number(0);
         let exit = Arc::new(AtomicBool::new(false));
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
@@ -1178,7 +1522,13 @@ pub(crate) mod tests {
         );
         subscriptions.add_program_subscription(
             solana_stake_program::id(),
-            None,
+            Some(RpcProgramAccountsConfig {
+                account_config: RpcAccountInfoConfig {
+                    commitment: Some(CommitmentConfig::processed()),
+                    ..RpcAccountInfoConfig::default()
+                },
+                ..RpcProgramAccountsConfig::default()
+            }),
             sub_id.clone(),
             subscriber,
         );
@@ -1303,47 +1653,47 @@ pub(crate) mod tests {
         subscriptions.add_signature_subscription(
             past_bank_tx.signatures[0],
             Some(RpcSignatureSubscribeConfig {
-                commitment: Some(CommitmentConfig::recent()),
+                commitment: Some(CommitmentConfig::processed()),
                 enable_received_notification: Some(false),
             }),
-            SubscriptionId::Number(1 as u64),
+            SubscriptionId::Number(1),
             past_bank_sub1,
         );
         subscriptions.add_signature_subscription(
             past_bank_tx.signatures[0],
             Some(RpcSignatureSubscribeConfig {
-                commitment: Some(CommitmentConfig::root()),
+                commitment: Some(CommitmentConfig::finalized()),
                 enable_received_notification: Some(false),
             }),
-            SubscriptionId::Number(2 as u64),
+            SubscriptionId::Number(2),
             past_bank_sub2,
         );
         subscriptions.add_signature_subscription(
             processed_tx.signatures[0],
             Some(RpcSignatureSubscribeConfig {
-                commitment: Some(CommitmentConfig::recent()),
+                commitment: Some(CommitmentConfig::processed()),
                 enable_received_notification: Some(false),
             }),
-            SubscriptionId::Number(3 as u64),
+            SubscriptionId::Number(3),
             processed_sub,
         );
         subscriptions.add_signature_subscription(
             unprocessed_tx.signatures[0],
             Some(RpcSignatureSubscribeConfig {
-                commitment: Some(CommitmentConfig::recent()),
+                commitment: Some(CommitmentConfig::processed()),
                 enable_received_notification: Some(false),
             }),
-            SubscriptionId::Number(4 as u64),
+            SubscriptionId::Number(4),
             Subscriber::new_test("signatureNotification").0,
         );
         // Add a subscription that gets `received` notifications
         subscriptions.add_signature_subscription(
             unprocessed_tx.signatures[0],
             Some(RpcSignatureSubscribeConfig {
-                commitment: Some(CommitmentConfig::recent()),
+                commitment: Some(CommitmentConfig::processed()),
                 enable_received_notification: Some(true),
             }),
-            SubscriptionId::Number(5 as u64),
+            SubscriptionId::Number(5),
             processed_sub3,
         );
 
@@ -1436,7 +1786,7 @@ pub(crate) mod tests {
     fn test_check_slot_subscribe() {
         let (subscriber, _id_receiver, transport_receiver) =
             Subscriber::new_test("slotNotification");
-        let sub_id = SubscriptionId::Number(0 as u64);
+        let sub_id = SubscriptionId::Number(0);
         let exit = Arc::new(AtomicBool::new(false));
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new(&genesis_config);
@@ -1487,7 +1837,7 @@ pub(crate) mod tests {
     fn test_check_root_subscribe() {
         let (subscriber, _id_receiver, mut transport_receiver) =
             Subscriber::new_test("rootNotification");
-        let sub_id = SubscriptionId::Number(0 as u64);
+        let sub_id = SubscriptionId::Number(0);
         let exit = Arc::new(AtomicBool::new(false));
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new(&genesis_config);
@@ -1537,13 +1887,22 @@ pub(crate) mod tests {
     fn test_add_and_remove_subscription() {
         let mut subscriptions: HashMap<u64, HashMap<SubscriptionId, SubscriptionData<(), ()>>> =
             HashMap::new();
+        let commitment = CommitmentConfig::confirmed();
 
         let num_keys = 5;
         for key in 0..num_keys {
             let (subscriber, _id_receiver, _transport_receiver) =
                 Subscriber::new_test("notification");
             let sub_id = SubscriptionId::Number(key);
-            add_subscription(&mut subscriptions, key, None, sub_id, subscriber, 0, None);
+            add_subscription(
+                &mut subscriptions,
+                key,
+                commitment,
+                sub_id,
+                subscriber,
+                0,
+                None,
+            );
         }
 
         // Add another subscription to the "0" key
@@ -1552,7 +1911,7 @@ pub(crate) mod tests {
         add_subscription(
             &mut subscriptions,
             0,
-            None,
+            commitment,
             extra_sub_id.clone(),
             subscriber,
             0,
@@ -1614,11 +1973,11 @@ pub(crate) mod tests {
             ))),
             optimistically_confirmed_bank.clone(),
         ));
-        let sub_id0 = SubscriptionId::Number(0 as u64);
+        let sub_id0 = SubscriptionId::Number(0);
         subscriptions.add_account_subscription(
             alice.pubkey(),
             Some(RpcAccountInfoConfig {
-                commitment: Some(CommitmentConfig::single_gossip()),
+                commitment: Some(CommitmentConfig::confirmed()),
                 encoding: None,
                 data_slice: None,
             }),
@@ -1695,11 +2054,11 @@ pub(crate) mod tests {
         assert_eq!(serde_json::to_string(&expected).unwrap(), response);
         subscriptions.remove_account_subscription(&sub_id0);
 
-        let sub_id1 = SubscriptionId::Number(1 as u64);
+        let sub_id1 = SubscriptionId::Number(1);
         subscriptions.add_account_subscription(
             alice.pubkey(),
             Some(RpcAccountInfoConfig {
-                commitment: Some(CommitmentConfig::single_gossip()),
+                commitment: Some(CommitmentConfig::confirmed()),
                 encoding: None,
                 data_slice: None,
             }),
@@ -1742,5 +2101,151 @@ pub(crate) mod tests {
             .read()
             .unwrap()
             .contains_key(&alice.pubkey()));
+    }
+
+    #[test]
+    fn test_total_nested_subscriptions() {
+        let mock_subscriptions = RwLock::new(HashMap::new());
+        assert_eq!(total_nested_subscriptions(&mock_subscriptions), 0);
+
+        mock_subscriptions
+            .write()
+            .unwrap()
+            .insert(0, HashMap::new());
+        assert_eq!(total_nested_subscriptions(&mock_subscriptions), 0);
+
+        mock_subscriptions
+            .write()
+            .unwrap()
+            .entry(0)
+            .and_modify(|map| {
+                map.insert(0, "test");
+            });
+        assert_eq!(total_nested_subscriptions(&mock_subscriptions), 1);
+
+        mock_subscriptions
+            .write()
+            .unwrap()
+            .entry(0)
+            .and_modify(|map| {
+                map.insert(1, "test");
+            });
+        assert_eq!(total_nested_subscriptions(&mock_subscriptions), 2);
+
+        mock_subscriptions
+            .write()
+            .unwrap()
+            .insert(1, HashMap::new());
+        assert_eq!(total_nested_subscriptions(&mock_subscriptions), 2);
+
+        mock_subscriptions
+            .write()
+            .unwrap()
+            .entry(1)
+            .and_modify(|map| {
+                map.insert(0, "test");
+            });
+        assert_eq!(total_nested_subscriptions(&mock_subscriptions), 3);
+    }
+
+    #[test]
+    fn test_total_subscriptions() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(100);
+        let bank = Bank::new(&genesis_config);
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let subscriptions = RpcSubscriptions::default_with_bank_forks(bank_forks);
+
+        let (subscriber, _id_receiver, _transport_receiver) =
+            Subscriber::new_test("accountNotification");
+        let account_sub_id = SubscriptionId::Number(0u64);
+        subscriptions.add_account_subscription(
+            Pubkey::default(),
+            None,
+            account_sub_id.clone(),
+            subscriber,
+        );
+        assert_eq!(subscriptions.total(), 1);
+
+        let (subscriber, _id_receiver, _transport_receiver) =
+            Subscriber::new_test("programNotification");
+        let program_sub_id = SubscriptionId::Number(1u64);
+        subscriptions.add_program_subscription(
+            Pubkey::default(),
+            None,
+            program_sub_id.clone(),
+            subscriber,
+        );
+        assert_eq!(subscriptions.total(), 2);
+
+        let (subscriber, _id_receiver, _transport_receiver) =
+            Subscriber::new_test("logsNotification");
+        let logs_sub_id = SubscriptionId::Number(2u64);
+        subscriptions.add_logs_subscription(None, false, None, logs_sub_id.clone(), subscriber);
+        assert_eq!(subscriptions.total(), 3);
+
+        let (subscriber, _id_receiver, _transport_receiver) =
+            Subscriber::new_test("signatureNotification");
+        let sig_sub_id = SubscriptionId::Number(3u64);
+        subscriptions.add_signature_subscription(
+            Signature::default(),
+            None,
+            sig_sub_id.clone(),
+            subscriber,
+        );
+        assert_eq!(subscriptions.total(), 4);
+
+        let (subscriber, _id_receiver, _transport_receiver) =
+            Subscriber::new_test("slotNotification");
+        let slot_sub_id = SubscriptionId::Number(4u64);
+        subscriptions.add_slot_subscription(slot_sub_id.clone(), subscriber);
+        assert_eq!(subscriptions.total(), 5);
+
+        let (subscriber, _id_receiver, _transport_receiver) =
+            Subscriber::new_test("voteNotification");
+        let vote_sub_id = SubscriptionId::Number(5u64);
+        subscriptions.add_vote_subscription(vote_sub_id.clone(), subscriber);
+        assert_eq!(subscriptions.total(), 6);
+
+        let (subscriber, _id_receiver, _transport_receiver) =
+            Subscriber::new_test("rootNotification");
+        let root_sub_id = SubscriptionId::Number(6u64);
+        subscriptions.add_root_subscription(root_sub_id.clone(), subscriber);
+        assert_eq!(subscriptions.total(), 7);
+
+        // Add duplicate account subscription to ensure totals include all subscriptions on all keys
+        let (subscriber, _id_receiver, _transport_receiver) =
+            Subscriber::new_test("accountNotification2");
+        let account_dupe_sub_id = SubscriptionId::Number(7u64);
+        subscriptions.add_account_subscription(
+            Pubkey::default(),
+            None,
+            account_dupe_sub_id.clone(),
+            subscriber,
+        );
+        assert_eq!(subscriptions.total(), 8);
+
+        subscriptions.remove_account_subscription(&account_sub_id);
+        assert_eq!(subscriptions.total(), 7);
+
+        subscriptions.remove_account_subscription(&account_dupe_sub_id);
+        assert_eq!(subscriptions.total(), 6);
+
+        subscriptions.remove_program_subscription(&program_sub_id);
+        assert_eq!(subscriptions.total(), 5);
+
+        subscriptions.remove_logs_subscription(&logs_sub_id);
+        assert_eq!(subscriptions.total(), 4);
+
+        subscriptions.remove_signature_subscription(&sig_sub_id);
+        assert_eq!(subscriptions.total(), 3);
+
+        subscriptions.remove_slot_subscription(&slot_sub_id);
+        assert_eq!(subscriptions.total(), 2);
+
+        subscriptions.remove_vote_subscription(&vote_sub_id);
+        assert_eq!(subscriptions.total(), 1);
+
+        subscriptions.remove_root_subscription(&root_sub_id);
+        assert_eq!(subscriptions.total(), 0);
     }
 }

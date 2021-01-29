@@ -15,26 +15,19 @@ use solana_sdk::{
     signature::{Keypair, Signer},
 };
 use solana_vote_program::vote_state::{VoteAuthorize, VoteState, VoteStateVersions};
-use std::{fs::remove_dir_all, sync::mpsc::channel};
 
 #[test]
 fn test_vote_authorize_and_withdraw() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let default_signer = Keypair::new();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     request_and_confirm_airdrop(
@@ -60,9 +53,7 @@ fn test_vote_authorize_and_withdraw() {
     };
     process_command(&config).unwrap();
     let vote_account = rpc_client
-        .get_account_with_commitment(&vote_account_keypair.pubkey(), CommitmentConfig::recent())
-        .unwrap()
-        .value
+        .get_account(&vote_account_keypair.pubkey())
         .unwrap();
     let vote_state: VoteStateVersions = vote_account.state().unwrap();
     let authorized_withdrawer = vote_state.convert_to_current().authorized_withdrawer;
@@ -100,9 +91,7 @@ fn test_vote_authorize_and_withdraw() {
     };
     process_command(&config).unwrap();
     let vote_account = rpc_client
-        .get_account_with_commitment(&vote_account_keypair.pubkey(), CommitmentConfig::recent())
-        .unwrap()
-        .value
+        .get_account(&vote_account_keypair.pubkey())
         .unwrap();
     let vote_state: VoteStateVersions = vote_account.state().unwrap();
     let authorized_withdrawer = vote_state.convert_to_current().authorized_withdrawer;
@@ -130,7 +119,4 @@ fn test_vote_authorize_and_withdraw() {
         withdraw_authority: 1,
     };
     process_command(&config).unwrap();
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }

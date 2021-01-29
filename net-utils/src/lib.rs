@@ -1,13 +1,17 @@
 //! The `net_utils` module assists with networking
-use log::*;
-use rand::{thread_rng, Rng};
-use socket2::{Domain, SockAddr, Socket, Type};
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::mpsc::channel;
-use std::time::Duration;
-use url::Url;
+use {
+    log::*,
+    rand::{thread_rng, Rng},
+    socket2::{Domain, SockAddr, Socket, Type},
+    std::{
+        collections::{BTreeMap, HashSet},
+        io::{self, Read, Write},
+        net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+        sync::{mpsc::channel, Arc, RwLock},
+        time::{Duration, Instant},
+    },
+    url::Url,
+};
 
 mod ip_echo_server;
 use ip_echo_server::IpEchoServerMessage;
@@ -22,16 +26,23 @@ pub struct UdpSocketPair {
 
 pub type PortRange = (u16, u16);
 
+pub(crate) const HEADER_LENGTH: usize = 4;
+pub(crate) fn ip_echo_server_reply_length() -> usize {
+    let largest_ip_addr = IpAddr::from([0u16; 8]); // IPv6 variant
+    HEADER_LENGTH + bincode::serialized_size(&largest_ip_addr).unwrap() as usize
+}
+
 fn ip_echo_server_request(
     ip_echo_server_addr: &SocketAddr,
     msg: IpEchoServerMessage,
 ) -> Result<IpAddr, String> {
-    let mut data = Vec::new();
+    let mut data = vec![0u8; ip_echo_server_reply_length()];
 
     let timeout = Duration::new(5, 0);
     TcpStream::connect_timeout(ip_echo_server_addr, timeout)
         .and_then(|mut stream| {
-            let mut bytes = vec![0; 4]; // Start with 4 null bytes to avoid looking like an HTTP GET/POST request
+            // Start with HEADER_LENGTH null bytes to avoid looking like an HTTP GET/POST request
+            let mut bytes = vec![0; HEADER_LENGTH];
 
             bytes.append(&mut bincode::serialize(&msg).expect("serialize IpEchoServerMessage"));
 
@@ -42,20 +53,21 @@ fn ip_echo_server_request(
             stream.set_read_timeout(Some(Duration::new(10, 0)))?;
             stream.write_all(&bytes)?;
             stream.shutdown(std::net::Shutdown::Write)?;
-            stream.read_to_end(&mut data)
+            stream.read(data.as_mut_slice())
         })
         .and_then(|_| {
             // It's common for users to accidentally confuse the validator's gossip port and JSON
             // RPC port.  Attempt to detect when this occurs by looking for the standard HTTP
             // response header and provide the user with a helpful error message
-            if data.len() < 4 {
+            if data.len() < HEADER_LENGTH {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("Response too short, received {} bytes", data.len()),
                 ));
             }
 
-            let response_header: String = data[0..4].iter().map(|b| *b as char).collect();
+            let response_header: String =
+                data[0..HEADER_LENGTH].iter().map(|b| *b as char).collect();
             if response_header != "\0\0\0\0" {
                 if response_header == "HTTP" {
                     let http_response = data.iter().map(|b| *b as char).collect::<String>();
@@ -76,7 +88,7 @@ fn ip_echo_server_request(
                 ));
             }
 
-            bincode::deserialize(&data[4..]).map_err(|err| {
+            bincode::deserialize(&data[HEADER_LENGTH..]).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::Other,
                     format!("Failed to deserialize: {:?}", err),
@@ -105,7 +117,7 @@ fn do_verify_reachable_ports(
     udp_retry_count: usize,
 ) -> bool {
     info!(
-        "Checking that tcp ports {:?} from {:?}",
+        "Checking that tcp ports {:?} are reachable from {:?}",
         tcp_listeners, ip_echo_server_addr
     );
 
@@ -196,21 +208,38 @@ fn do_verify_reachable_ports(
             .map_err(|err| warn!("ip_echo_server request failed: {}", err));
 
             // Spawn threads at once!
+            let reachable_ports = Arc::new(RwLock::new(HashSet::new()));
             let thread_handles: Vec<_> = checked_socket_iter
                 .map(|udp_socket| {
                     let port = udp_socket.local_addr().unwrap().port();
                     let udp_socket = udp_socket.try_clone().expect("Unable to clone udp socket");
+                    let reachable_ports = reachable_ports.clone();
                     std::thread::spawn(move || {
-                        let mut buf = [0; 1];
+                        let start = Instant::now();
+
                         let original_read_timeout = udp_socket.read_timeout().unwrap();
-                        udp_socket.set_read_timeout(Some(timeout)).unwrap();
-                        let recv_result = udp_socket.recv(&mut buf);
-                        debug!(
-                            "Waited for incoming datagram on udp/{}: {:?}",
-                            port, recv_result
-                        );
+                        udp_socket
+                            .set_read_timeout(Some(Duration::from_millis(250)))
+                            .unwrap();
+                        loop {
+                            if reachable_ports.read().unwrap().contains(&port)
+                                || Instant::now().duration_since(start) >= timeout
+                            {
+                                break;
+                            }
+
+                            let recv_result = udp_socket.recv(&mut [0; 1]);
+                            debug!(
+                                "Waited for incoming datagram on udp/{}: {:?}",
+                                port, recv_result
+                            );
+
+                            if recv_result.is_ok() {
+                                reachable_ports.write().unwrap().insert(port);
+                                break;
+                            }
+                        }
                         udp_socket.set_read_timeout(original_read_timeout).unwrap();
-                        recv_result.map(|_| port).ok()
                     })
                 })
                 .collect();
@@ -219,11 +248,11 @@ fn do_verify_reachable_ports(
             // Separate from the above by collect()-ing as an intermediately step to make the iterator
             // eager not lazy so that joining happens here at once after creating bunch of threads
             // at once.
-            let reachable_ports: BTreeSet<_> = thread_handles
-                .into_iter()
-                .filter_map(|t| t.join().unwrap())
-                .collect();
+            for thread in thread_handles {
+                thread.join().unwrap();
+            }
 
+            let reachable_ports = reachable_ports.read().unwrap().clone();
             if reachable_ports.len() == checked_ports.len() {
                 info!(
                     "checked udp ports: {:?}, reachable udp ports: {:?}",
@@ -326,7 +355,7 @@ pub fn is_host(string: String) -> Result<(), String> {
 pub fn parse_host_port(host_port: &str) -> Result<SocketAddr, String> {
     let addrs: Vec<_> = host_port
         .to_socket_addrs()
-        .map_err(|err| err.to_string())?
+        .map_err(|err| format!("Unable to resolve host {}: {}", host_port, err))?
         .collect();
     if addrs.is_empty() {
         Err(format!("Unable to resolve host: {}", host_port))
@@ -573,7 +602,7 @@ mod tests {
             3000
         );
         let port = find_available_port_in_range(ip_addr, (3000, 3050)).unwrap();
-        assert!(3000 <= port && port < 3050);
+        assert!((3000..3050).contains(&port));
 
         let _socket = bind_to(ip_addr, port, false).unwrap();
         find_available_port_in_range(ip_addr, (port, port + 1)).unwrap_err();
@@ -583,7 +612,7 @@ mod tests {
     fn test_bind_common_in_range() {
         let ip_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
         let (port, _sockets) = bind_common_in_range(ip_addr, (3100, 3150)).unwrap();
-        assert!(3100 <= port && port < 3150);
+        assert!((3100..3150).contains(&port));
 
         bind_common_in_range(ip_addr, (port, port + 1)).unwrap_err();
     }

@@ -94,7 +94,11 @@ Add
 LimitNOFILE=500000
 ```
 to the `[Service]` section of your systemd service file, if you use one,
-otherwise add it to `/etc/systemd/system.conf`.
+otherwise add
+```
+DefaultLimitNOFILE=500000
+```
+to the `[Manager]` section of `/etc/systemd/system.conf`.
 ```bash
 sudo systemctl daemon-reload
 ```
@@ -141,7 +145,7 @@ solana-keygen pubkey ASK
 
 and then entering your seed phrase.
 
-See [Paper Wallet Usage](../paper-wallet/paper-wallet-usage.md) for more info.
+See [Paper Wallet Usage](../wallet-guide/paper-wallet.md) for more info.
 
 ---
 
@@ -192,8 +196,8 @@ Airdrop yourself some SOL to get started:
 solana airdrop 10
 ```
 
-Note that airdrops are only available on Devnet. Testnet SOL can be obtained by
-participating in the [Tour de SOL](../tour-de-sol.md) program.
+Note that airdrops are only available on Devnet and Testnet. Both are limited
+to 10 SOL per request.
 
 To view your current balance:
 
@@ -261,10 +265,10 @@ To force validator logging to the console add a `--log -` argument, otherwise
 the validator will automatically log to a file.
 
 > Note: You can use a
-> [paper wallet seed phrase](../paper-wallet/paper-wallet-usage.md)
+> [paper wallet seed phrase](../wallet-guide/paper-wallet.md)
 > for your `--identity` and/or
-> `--vote-account` keypairs. To use these, pass the respective argument as
-> `solana-validator --identity ASK ... --vote-account ASK ...` and you will be
+> `--authorized-voter` keypairs. To use these, pass the respective argument as
+> `solana-validator --identity ASK ... --authorized-voter ASK ...` and you will be
 > prompted to enter your seed phrases and optional passphrase.
 
 Confirm your validator connected to the network by opening a new terminal and
@@ -332,7 +336,18 @@ Start the service with:
 $ sudo systemctl enable --now sol
 ```
 
-### Log rotation
+### Logging
+#### Log output tuning
+
+The messages that a validator emits to the log can be controlled by the `RUST_LOG`
+environment variable. Details can by found in the [documentation](https://docs.rs/env_logger/latest/env_logger/#enabling-logging)
+for the `env_logger` Rust crate.
+
+Note that if logging output is reduced, this may make it difficult to debug issues
+encountered later. Should support be sought from the team, any changes will need
+to be reverted and the issue reproduced before help can be provided.
+
+#### Log rotation
 
 The validator log file, as specified by `--log ~/solana-validator.log`, can get
 very large over time and it's recommended that log rotation be configured.
@@ -340,7 +355,7 @@ very large over time and it's recommended that log rotation be configured.
 The validator will re-open its when it receives the `USR1` signal, which is the
 basic primitive that enables log rotation.
 
-### Using logrotate
+#### Using logrotate
 
 An example setup for the `logrotate`, which assumes that the validator is
 running as a systemd service called `sol.service` and writes a log file at
@@ -361,3 +376,62 @@ EOF
 sudo cp logrotate.sol /etc/logrotate.d/sol
 systemctl restart logrotate.service
 ```
+
+### Disable port checks to speed up restarts
+Once your validator is operating normally, you can reduce the time it takes to
+restart your validator by adding the `--no-port-check` flag to your
+`solana-validator` command-line.
+
+### Disable snapshot compression to reduce CPU usage
+If you are not serving snapshots to other validators, snapshot compression can
+be disabled to reduce CPU load at the expense of slightly more disk usage for
+local snapshot storage.
+
+Add the `--snapshot-compression none` argument to your `solana-validator`
+command-line arguments and restart the validator.
+
+### Using a ramdisk with spill-over into swap for the accounts database to reduce SSD wear
+If your machine has plenty of RAM, a tmpfs ramdisk
+([tmpfs](https://man7.org/linux/man-pages/man5/tmpfs.5.html)) may be used to hold
+the accounts database
+
+When using tmpfs it's essential to also configure swap on your machine as well to
+avoid running out of tmpfs space periodically.
+
+A 300GB tmpfs partition is recommended, with an accompanying 250GB swap
+partition.
+
+Example configuration:
+1. `sudo mkdir /mnt/solana-accounts`
+2. Add a 300GB tmpfs parition by adding a new line containing `tmpfs
+   /mnt/solana-accounts tmpfs rw,size=300G,user=sol 0 0` to `/etc/fstab`
+   (assuming your validator is running under the user "sol").  **CAREFUL: If you
+   incorrectly edit /etc/fstab your machine may no longer boot**
+3. Create at least 250GB of swap space
+  - Choose a device to use in place of `SWAPDEV` for the remainder of these instructions.
+    Ideally select a free disk partition of 250GB or greater on a fast disk. If one is not
+    available, create a swap file with `sudo dd if=/dev/zero of=/swapfile bs=1MiB count=250KiB`,
+    set its permissions with `sudo chmod 0600 /swapfile` and use `/swapfile` as `SWAPDEV` for
+    the remainder of these instructions
+  - Format the device for usage as swap with `sudo mkswap SWAPDEV`
+4. Add the swap file to `/etc/fstab` with a new line containing `SWAPDEV swap swap defaults 0 0`
+5. Enable swap with `sudo swapon -a` and mount the tmpfs with `sudo mount /mnt/solana-accounts/`
+6. Confirm swap is active with `free -g` and the tmpfs is mounted with `mount`
+
+Now add the `--accounts /mnt/solana-accounts` argument to your `solana-validator`
+command-line arguments and restart the validator.
+
+### Account indexing
+
+As the number of populated accounts on the cluster grows, account-data RPC
+requests that scan the entire account set  -- like
+[`getProgramAccounts`](developing/clients/jsonrpc-api.md#getprogramaccounts) and
+[SPL-token-specific requests](developing/clients/jsonrpc-api.md#gettokenaccountsbydelegate) --
+may perform poorly. If your validator needs to support any of these requests,
+you can use the `--account-index` parameter to activate one or more in-memory
+account indexes that significantly improve RPC performance by indexing accounts
+by the key field. Currently supports the following parameter values:
+
+- `program-id`: each account indexed by its owning program; used by [`getProgramAccounts`](developing/clients/jsonrpc-api.md#getprogramaccounts)
+- `spl-token-mint`: each SPL token account indexed by its token Mint; used by [getTokenAccountsByDelegate](developing/clients/jsonrpc-api.md#gettokenaccountsbydelegate), and [getTokenLargestAccounts](developing/clients/jsonrpc-api.md#gettokenlargestaccounts)
+- `spl-token-owner`: each SPL token account indexed by the token-owner address; used by [getTokenAccountsByOwner](developing/clients/jsonrpc-api.md#gettokenaccountsbyowner), and [`getProgramAccounts`](developing/clients/jsonrpc-api.md#getprogramaccounts) requests that include an spl-token-owner filter.

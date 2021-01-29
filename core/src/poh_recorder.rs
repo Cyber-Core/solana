@@ -404,13 +404,13 @@ impl PohRecorder {
             {
                 let now = Instant::now();
                 let mut poh_lock = self.poh.lock().unwrap();
-                inc_new_counter_warn!(
+                inc_new_counter_info!(
                     "poh_recorder-record_lock_contention",
                     timing::duration_as_us(&now.elapsed()) as usize
                 );
                 let now = Instant::now();
                 let res = poh_lock.record(mixin);
-                inc_new_counter_warn!(
+                inc_new_counter_info!(
                     "poh_recorder-record_ms",
                     timing::duration_as_us(&now.elapsed()) as usize
                 );
@@ -1228,8 +1228,10 @@ mod tests {
                 init_ticks + bank.ticks_per_slot()
             );
 
-            let mut parent_meta = SlotMeta::default();
-            parent_meta.received = 1;
+            let parent_meta = SlotMeta {
+                received: 1,
+                ..SlotMeta::default()
+            };
             poh_recorder
                 .blockstore
                 .put_meta_bytes(0, &serialize(&parent_meta).unwrap())

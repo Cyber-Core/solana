@@ -11,17 +11,9 @@ pub const PACKETS_PER_BATCH: usize = 256;
 pub const NUM_RCVMMSGS: usize = 128;
 pub const PACKETS_BATCH_SIZE: usize = PACKETS_PER_BATCH * PACKET_DATA_SIZE;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Packets {
     pub packets: PinnedVec<Packet>,
-}
-
-//auto derive doesn't support large arrays
-impl Default for Packets {
-    fn default() -> Packets {
-        let packets = PinnedVec::with_capacity(NUM_RCVMMSGS);
-        Packets { packets }
-    }
 }
 
 pub type PacketsRecycler = Recycler<PinnedVec<Packet>>;
@@ -30,6 +22,11 @@ impl Packets {
     pub fn new(packets: Vec<Packet>) -> Self {
         let packets = PinnedVec::from_vec(packets);
         Self { packets }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let packets = PinnedVec::with_capacity(capacity);
+        Packets { packets }
     }
 
     pub fn new_with_recycler(recycler: PacketsRecycler, size: usize, name: &'static str) -> Self {
@@ -61,7 +58,7 @@ impl Packets {
 pub fn to_packets_chunked<T: Serialize>(xs: &[T], chunks: usize) -> Vec<Packets> {
     let mut out = vec![];
     for x in xs.chunks(chunks) {
-        let mut p = Packets::default();
+        let mut p = Packets::with_capacity(x.len());
         p.packets.resize(x.len(), Packet::default());
         for (i, o) in x.iter().zip(p.packets.iter_mut()) {
             Packet::populate_packet(o, None, i).expect("serialize request");
@@ -71,6 +68,7 @@ pub fn to_packets_chunked<T: Serialize>(xs: &[T], chunks: usize) -> Vec<Packets>
     out
 }
 
+#[cfg(test)]
 pub fn to_packets<T: Serialize>(xs: &[T]) -> Vec<Packets> {
     to_packets_chunked(xs, NUM_PACKETS)
 }
@@ -88,6 +86,9 @@ pub fn to_packets_with_destination<T: Serialize>(
     for (dest_and_data, o) in dests_and_data.iter().zip(out.packets.iter_mut()) {
         if !dest_and_data.0.ip().is_unspecified() && dest_and_data.0.port() != 0 {
             if let Err(e) = Packet::populate_packet(o, Some(&dest_and_data.0), &dest_and_data.1) {
+                // TODO: This should never happen. Instead the caller should
+                // break the payload into smaller messages, and here any errors
+                // should be propagated.
                 error!("Couldn't write to packet {:?}. Data skipped.", e);
             }
         } else {

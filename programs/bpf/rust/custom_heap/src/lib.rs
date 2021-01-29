@@ -1,10 +1,10 @@
 //! @brief Example Rust-based BPF that tests out using a custom heap
 
-use solana_sdk::{
+use solana_program::{
     account_info::AccountInfo,
     entrypoint,
     entrypoint::{ProgramResult, HEAP_LENGTH, HEAP_START_ADDRESS},
-    info,
+    msg,
     pubkey::Pubkey,
 };
 use std::{
@@ -53,12 +53,13 @@ unsafe impl std::alloc::GlobalAlloc for BumpAllocator {
 static A: BumpAllocator = BumpAllocator;
 
 entrypoint!(process_instruction);
-fn process_instruction(
+#[allow(clippy::unnecessary_wraps)]
+pub fn process_instruction(
     _program_id: &Pubkey,
     _accounts: &[AccountInfo],
     _instruction_data: &[u8],
 ) -> ProgramResult {
-    info!("Custom heap");
+    msg!("Custom heap");
     unsafe {
         let layout = Layout::from_size_align(usize::MAX - 0x42, align_of::<u8>()).unwrap();
         let ptr = alloc(layout);

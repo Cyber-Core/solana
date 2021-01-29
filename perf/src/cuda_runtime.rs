@@ -89,6 +89,17 @@ impl<T: Clone + Default + Sized> Default for PinnedVec<T> {
     }
 }
 
+impl<T: Clone + Default + Sized> From<PinnedVec<T>> for Vec<T> {
+    fn from(mut pinned_vec: PinnedVec<T>) -> Self {
+        if pinned_vec.pinned {
+            unpin(pinned_vec.x.as_mut_ptr());
+            pinned_vec.pinned = false;
+        }
+        pinned_vec.pinnable = false;
+        pinned_vec.recycler = None;
+        std::mem::take(&mut pinned_vec.x)
+    }
+}
 pub struct PinnedIter<'a, T>(std::slice::Iter<'a, T>);
 
 pub struct PinnedIterMut<'a, T>(std::slice::IterMut<'a, T>);
@@ -106,6 +117,15 @@ impl<'a, T: Clone + Default + Sized> Iterator for PinnedIterMut<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next()
+    }
+}
+
+impl<T: Clone + Default + Sized> IntoIterator for PinnedVec<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        <Self as Into<Vec<T>>>::into(self).into_iter()
     }
 }
 
@@ -169,14 +189,8 @@ impl<T: Clone + Default + Send + Sized> IntoParallelIterator for PinnedVec<T> {
     type Item = T;
     type Iter = rayon::vec::IntoIter<T>;
 
-    fn into_par_iter(mut self) -> Self::Iter {
-        if self.pinned {
-            unpin(self.x.as_mut_ptr());
-            self.pinned = false;
-        }
-        self.pinnable = false;
-        self.recycler = None;
-        std::mem::take(&mut self.x).into_par_iter()
+    fn into_par_iter(self) -> Self::Iter {
+        <Self as Into<Vec<T>>>::into(self).into_par_iter()
     }
 }
 

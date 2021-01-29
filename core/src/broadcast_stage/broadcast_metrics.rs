@@ -13,22 +13,6 @@ pub(crate) struct BroadcastShredBatchInfo {
 }
 
 #[derive(Default, Clone)]
-pub(crate) struct ProcessShredsStats {
-    // Per-slot elapsed time
-    pub(crate) shredding_elapsed: u64,
-    pub(crate) receive_elapsed: u64,
-}
-impl ProcessShredsStats {
-    pub(crate) fn update(&mut self, new_stats: &ProcessShredsStats) {
-        self.shredding_elapsed += new_stats.shredding_elapsed;
-        self.receive_elapsed += new_stats.receive_elapsed;
-    }
-    pub(crate) fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
-#[derive(Default, Clone)]
 pub struct TransmitShredsStats {
     pub transmit_elapsed: u64,
     pub send_mmsg_elapsed: u64,
@@ -286,10 +270,9 @@ mod test {
             }
 
             assert!(slot_broadcast_stats.lock().unwrap().0.get(&slot).is_none());
-            let (returned_count, returned_slot, returned_instant) = receiver.recv().unwrap();
+            let (returned_count, returned_slot, _returned_instant) = receiver.recv().unwrap();
             assert_eq!(returned_count, num_threads);
             assert_eq!(returned_slot, slot);
-            assert_eq!(returned_instant, returned_instant);
         }
     }
 }

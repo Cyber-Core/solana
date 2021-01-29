@@ -27,11 +27,10 @@ fn copy_append_vecs<P: AsRef<Path>>(
     let storage_entries = accounts_db.get_snapshot_storages(Slot::max_value());
     for storage in storage_entries.iter().flatten() {
         let storage_path = storage.get_path();
-        let output_path = output_dir.as_ref().join(
-            storage_path
-                .file_name()
-                .expect("Invalid AppendVec file path"),
-        );
+        let output_path = output_dir.as_ref().join(AppendVec::new_relative_path(
+            storage.slot(),
+            storage.append_vec_id(),
+        ));
 
         std::fs::copy(storage_path, output_path)?;
     }
@@ -70,6 +69,8 @@ where
         account_paths,
         stream_append_vecs_path,
         &ClusterType::Development,
+        HashSet::new(),
+        false,
     )
 }
 
@@ -121,7 +122,8 @@ where
 fn test_accounts_serialize_style(serde_style: SerdeStyle) {
     solana_logger::setup();
     let (_accounts_dir, paths) = get_temp_accounts_paths(4).unwrap();
-    let accounts = Accounts::new(paths, &ClusterType::Development);
+    let accounts =
+        Accounts::new_with_config(paths, &ClusterType::Development, HashSet::new(), false);
 
     let mut pubkeys: Vec<Pubkey> = vec![];
     create_test_accounts(&accounts, &mut pubkeys, 100, 0);
@@ -181,7 +183,9 @@ fn test_bank_serialize_style(serde_style: SerdeStyle) {
     let key3 = Keypair::new();
     bank2.deposit(&key3.pubkey(), 0);
 
+    bank2.freeze();
     bank2.squash();
+    bank2.force_flush_accounts_cache();
 
     let snapshot_storages = bank2.get_snapshot_storages();
     let mut buf = vec![];
@@ -213,6 +217,8 @@ fn test_bank_serialize_style(serde_style: SerdeStyle) {
         &[],
         None,
         None,
+        HashSet::new(),
+        false,
     )
     .unwrap();
     dbank.src = ref_sc;
@@ -262,7 +268,7 @@ mod test_bank_serialize {
 
     // These some what long test harness is required to freeze the ABI of
     // Bank's serialization due to versioned nature
-    #[frozen_abi(digest = "ULV2jDndxR3JB677ayyjaamtAcZ24q75tCkHS2bKVoy")]
+    #[frozen_abi(digest = "Gv3em1cZt9cjQWepg8C5aaK95deyA1fifowRfmmTuoES")]
     #[derive(Serialize, AbiExample)]
     pub struct BankAbiTestWrapperFuture {
         #[serde(serialize_with = "wrapper_future")]

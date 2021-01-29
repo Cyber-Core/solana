@@ -175,6 +175,30 @@ EOF
       "Stable-perf skipped as no relevant files were modified"
   fi
 
+  # Downstream backwards compatibility
+  if affects \
+             .rs$ \
+             Cargo.lock$ \
+             Cargo.toml$ \
+             ^ci/rust-version.sh \
+             ^ci/test-stable-perf.sh \
+             ^ci/test-stable.sh \
+             ^ci/test-local-cluster.sh \
+             ^core/build.rs \
+             ^fetch-perf-libs.sh \
+             ^programs/ \
+             ^sdk/ \
+             ^scripts/build-downstream-projects.sh \
+      ; then
+    cat >> "$output_file" <<"EOF"
+  - command: "scripts/build-downstream-projects.sh"
+    name: "downstream-projects"
+    timeout_in_minutes: 30
+EOF
+  else
+    annotate --style info \
+      "downstream-projects skipped as no relevant files were modified"
+  fi
   # Benches...
   if affects \
              .rs$ \
@@ -239,7 +263,7 @@ if [[ $BUILDKITE_BRANCH =~ ^pull ]]; then
   annotate --style info --context pr-backlink \
     "Github Pull Request: https://github.com/solana-labs/solana/$BUILDKITE_BRANCH"
 
-  if [[ $GITHUB_USER = "dependabot-preview[bot]" ]]; then
+  if [[ $GITHUB_USER = "dependabot[bot]" ]]; then
     command_step dependabot "ci/dependabot-pr.sh" 5
     wait_step
   fi

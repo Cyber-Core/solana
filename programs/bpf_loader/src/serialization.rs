@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use solana_sdk::{
-    account::KeyedAccount, bpf_loader_deprecated, entrypoint::MAX_PERMITTED_DATA_INCREASE,
-    instruction::InstructionError, pubkey::Pubkey,
+    bpf_loader_deprecated, entrypoint::MAX_PERMITTED_DATA_INCREASE, instruction::InstructionError,
+    keyed_account::KeyedAccount, pubkey::Pubkey,
 };
 use std::{
     io::prelude::*,
@@ -48,8 +48,6 @@ pub fn serialize_parameters_unaligned(
     keyed_accounts: &[KeyedAccount],
     instruction_data: &[u8],
 ) -> Result<Vec<u8>, InstructionError> {
-    assert_eq!(32, size_of::<Pubkey>());
-
     // Calculate size in order to alloc once
     let mut size = size_of::<u64>();
     for (i, keyed_account) in keyed_accounts.iter().enumerate() {
@@ -106,8 +104,6 @@ pub fn deserialize_parameters_unaligned(
     keyed_accounts: &[KeyedAccount],
     buffer: &[u8],
 ) -> Result<(), InstructionError> {
-    assert_eq!(32, size_of::<Pubkey>());
-
     let mut start = size_of::<u64>(); // number of accounts
     for (i, keyed_account) in keyed_accounts.iter().enumerate() {
         let (is_dup, _) = is_dup(&keyed_accounts[..i], keyed_account);
@@ -139,8 +135,6 @@ pub fn serialize_parameters_aligned(
     keyed_accounts: &[KeyedAccount],
     instruction_data: &[u8],
 ) -> Result<Vec<u8>, InstructionError> {
-    assert_eq!(32, size_of::<Pubkey>());
-
     // Calculate size in order to alloc once
     let mut size = size_of::<u64>();
     for (i, keyed_account) in keyed_accounts.iter().enumerate() {
@@ -209,8 +203,6 @@ pub fn deserialize_parameters_aligned(
     keyed_accounts: &[KeyedAccount],
     buffer: &[u8],
 ) -> Result<(), InstructionError> {
-    assert_eq!(32, size_of::<Pubkey>());
-
     let mut start = size_of::<u64>(); // number of accounts
     for (i, keyed_account) in keyed_accounts.iter().enumerate() {
         let (is_dup, _) = is_dup(&keyed_accounts[..i], keyed_account);

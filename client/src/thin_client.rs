@@ -3,7 +3,7 @@
 //! messages to the network directly. The binary encoding of its messages are
 //! unstable and may change in future releases.
 
-use crate::{rpc_client::RpcClient, rpc_response::Response};
+use crate::{rpc_client::RpcClient, rpc_config::RpcProgramAccountsConfig, rpc_response::Response};
 use bincode::{serialize_into, serialized_size};
 use log::*;
 use solana_sdk::{
@@ -276,6 +276,16 @@ impl ThinClient {
         )
     }
 
+    pub fn get_program_accounts_with_config(
+        &self,
+        pubkey: &Pubkey,
+        config: RpcProgramAccountsConfig,
+    ) -> TransportResult<Vec<(Pubkey, Account)>> {
+        self.rpc_client()
+            .get_program_accounts_with_config(pubkey, config)
+            .map_err(|e| e.into())
+    }
+
     pub fn wait_for_balance_with_commitment(
         &self,
         pubkey: &Pubkey,
@@ -387,6 +397,12 @@ impl SyncClient for ThinClient {
             .get_balance_with_commitment(pubkey, commitment_config)
             .map_err(|e| e.into())
             .map(|r| r.value)
+    }
+
+    fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> TransportResult<u64> {
+        self.rpc_client()
+            .get_minimum_balance_for_rent_exemption(data_len)
+            .map_err(|e| e.into())
     }
 
     fn get_recent_blockhash(&self) -> TransportResult<(Hash, FeeCalculator)> {

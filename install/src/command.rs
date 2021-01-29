@@ -360,7 +360,7 @@ fn get_windows_path_var() -> Result<Option<String>, String> {
 }
 
 #[cfg(windows)]
-fn add_to_path(new_path: &str) -> Result<bool, String> {
+fn add_to_path(new_path: &str) -> bool {
     use std::ptr;
     use winapi::shared::minwindef::*;
     use winapi::um::winuser::{
@@ -369,10 +369,12 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
     use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::{RegKey, RegValue};
 
-    let old_path = if let Some(s) = get_windows_path_var()? {
+    let old_path = if let Some(s) =
+        get_windows_path_var().unwrap_or_else(|err| panic!("Unable to get PATH: {}", err))
+    {
         s
     } else {
-        return Ok(false);
+        return false;
     };
 
     if !old_path.contains(&new_path) {
@@ -385,7 +387,7 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
         let root = RegKey::predef(HKEY_CURRENT_USER);
         let environment = root
             .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-            .map_err(|err| format!("Unable to open HKEY_CURRENT_USER\\Environment: {}", err))?;
+            .unwrap_or_else(|err| panic!("Unable to open HKEY_CURRENT_USER\\Environment: {}", err));
 
         let reg_value = RegValue {
             bytes: string_to_winreg_bytes(&new_path),
@@ -394,7 +396,9 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
 
         environment
             .set_raw_value("PATH", &reg_value)
-            .map_err(|err| format!("Unable set HKEY_CURRENT_USER\\Environment\\PATH: {}", err))?;
+            .unwrap_or_else(|err| {
+                panic!("Unable set HKEY_CURRENT_USER\\Environment\\PATH: {}", err)
+            });
 
         // Tell other processes to update their environment
         unsafe {
@@ -416,28 +420,28 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
         new_path,
         style("Future applications will automatically have the correct environment, but you may need to restart your current shell.").bold()
     );
-    Ok(true)
+    true
 }
 
 #[cfg(unix)]
-fn add_to_path(new_path: &str) -> Result<bool, String> {
+fn add_to_path(new_path: &str) -> bool {
     let shell_export_string = format!(r#"export PATH="{}:$PATH""#, new_path);
     let mut modified_rcfiles = false;
 
     // Look for sh, bash, and zsh rc files
-    let mut rcfiles = vec![dirs::home_dir().map(|p| p.join(".profile"))];
+    let mut rcfiles = vec![dirs_next::home_dir().map(|p| p.join(".profile"))];
     if let Ok(shell) = std::env::var("SHELL") {
         if shell.contains("zsh") {
             let zdotdir = std::env::var("ZDOTDIR")
                 .ok()
                 .map(PathBuf::from)
-                .or_else(dirs::home_dir);
+                .or_else(dirs_next::home_dir);
             let zprofile = zdotdir.map(|p| p.join(".zprofile"));
             rcfiles.push(zprofile);
         }
     }
 
-    if let Some(bash_profile) = dirs::home_dir().map(|p| p.join(".bash_profile")) {
+    if let Some(bash_profile) = dirs_next::home_dir().map(|p| p.join(".bash_profile")) {
         // Only update .bash_profile if it exists because creating .bash_profile
         // will cause .profile to not be read
         if bash_profile.exists() {
@@ -502,7 +506,7 @@ fn add_to_path(new_path: &str) -> Result<bool, String> {
        );
     }
 
-    Ok(modified_rcfiles)
+    modified_rcfiles
 }
 
 pub fn init(
@@ -533,7 +537,7 @@ pub fn init(
     update(config_file)?;
 
     let path_modified = if !no_modify_path {
-        add_to_path(&config.active_release_bin_dir().to_str().unwrap())?
+        add_to_path(&config.active_release_bin_dir().to_str().unwrap())
     } else {
         false
     };
@@ -580,6 +584,16 @@ pub fn info(
             "SOLANA_INSTALL_ACTIVE_RELEASE={}",
             &config.active_release_dir().to_str().unwrap_or("")
         );
+        config
+            .explicit_release
+            .map(|er| match er {
+                ExplicitRelease::Semver(semver) => semver,
+                ExplicitRelease::Channel(channel) => channel,
+            })
+            .and_then(|channel| {
+                println!("SOLANA_INSTALL_ACTIVE_CHANNEL={}", channel,);
+                Option::<String>::None
+            });
         return Ok(None);
     }
 

@@ -9,11 +9,14 @@ pub mod parse_instruction;
 pub mod parse_stake;
 pub mod parse_system;
 pub mod parse_token;
+pub mod parse_vote;
+pub mod token_balances;
 
 use crate::{
     parse_accounts::{parse_accounts, ParsedAccount},
     parse_instruction::{parse, ParsedInstruction},
 };
+use solana_account_decoder::parse_token::UiTokenAmount;
 pub use solana_runtime::bank::RewardType;
 use solana_sdk::{
     clock::{Slot, UnixTimestamp},
@@ -22,11 +25,11 @@ use solana_sdk::{
     instruction::CompiledInstruction,
     message::{Message, MessageHeader},
     pubkey::Pubkey,
+    sanitize::Sanitize,
     signature::Signature,
     transaction::{Result, Transaction, TransactionError},
 };
 use std::fmt;
-
 /// A duplicate representation of an Instruction for pretty JSON serialization
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", untagged)]
@@ -114,6 +117,31 @@ pub struct UiInnerInstructions {
     pub instructions: Vec<UiInstruction>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TransactionTokenBalance {
+    pub account_index: u8,
+    pub mint: String,
+    pub ui_token_amount: UiTokenAmount,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiTransactionTokenBalance {
+    pub account_index: u8,
+    pub mint: String,
+    pub ui_token_amount: UiTokenAmount,
+}
+
+impl From<TransactionTokenBalance> for UiTransactionTokenBalance {
+    fn from(token_balance: TransactionTokenBalance) -> Self {
+        Self {
+            account_index: token_balance.account_index,
+            mint: token_balance.mint,
+            ui_token_amount: token_balance.ui_token_amount,
+        }
+    }
+}
+
 impl UiInnerInstructions {
     fn parse(inner_instructions: InnerInstructions, message: &Message) -> Self {
         Self {
@@ -151,6 +179,10 @@ pub struct TransactionStatusMeta {
     pub inner_instructions: Option<Vec<InnerInstructions>>,
     #[serde(deserialize_with = "default_on_eof")]
     pub log_messages: Option<Vec<String>>,
+    #[serde(deserialize_with = "default_on_eof")]
+    pub pre_token_balances: Option<Vec<TransactionTokenBalance>>,
+    #[serde(deserialize_with = "default_on_eof")]
+    pub post_token_balances: Option<Vec<TransactionTokenBalance>>,
 }
 
 impl Default for TransactionStatusMeta {
@@ -162,6 +194,8 @@ impl Default for TransactionStatusMeta {
             post_balances: vec![],
             inner_instructions: None,
             log_messages: None,
+            pre_token_balances: None,
+            post_token_balances: None,
         }
     }
 }
@@ -177,6 +211,8 @@ pub struct UiTransactionStatusMeta {
     pub post_balances: Vec<u64>,
     pub inner_instructions: Option<Vec<UiInnerInstructions>>,
     pub log_messages: Option<Vec<String>>,
+    pub pre_token_balances: Option<Vec<UiTransactionTokenBalance>>,
+    pub post_token_balances: Option<Vec<UiTransactionTokenBalance>>,
 }
 
 impl UiTransactionStatusMeta {
@@ -193,6 +229,12 @@ impl UiTransactionStatusMeta {
                     .collect()
             }),
             log_messages: meta.log_messages,
+            pre_token_balances: meta
+                .pre_token_balances
+                .map(|balance| balance.into_iter().map(|balance| balance.into()).collect()),
+            post_token_balances: meta
+                .post_token_balances
+                .map(|balance| balance.into_iter().map(|balance| balance.into()).collect()),
         }
     }
 }
@@ -209,8 +251,22 @@ impl From<TransactionStatusMeta> for UiTransactionStatusMeta {
                 .inner_instructions
                 .map(|ixs| ixs.into_iter().map(|ix| ix.into()).collect()),
             log_messages: meta.log_messages,
+            pre_token_balances: meta
+                .pre_token_balances
+                .map(|balance| balance.into_iter().map(|balance| balance.into()).collect()),
+            post_token_balances: meta
+                .post_token_balances
+                .map(|balance| balance.into_iter().map(|balance| balance.into()).collect()),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransactionConfirmationStatus {
+    Processed,
+    Confirmed,
+    Finalized,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -220,12 +276,41 @@ pub struct TransactionStatus {
     pub confirmations: Option<usize>, // None = rooted
     pub status: Result<()>,           // legacy field
     pub err: Option<TransactionError>,
+    pub confirmation_status: Option<TransactionConfirmationStatus>,
 }
 
 impl TransactionStatus {
     pub fn satisfies_commitment(&self, commitment_config: CommitmentConfig) -> bool {
-        (commitment_config == CommitmentConfig::default() && self.confirmations.is_none())
-            || commitment_config == CommitmentConfig::recent()
+        if commitment_config.is_finalized() {
+            self.confirmations.is_none()
+        } else if commitment_config.is_confirmed() {
+            if let Some(status) = &self.confirmation_status {
+                *status != TransactionConfirmationStatus::Processed
+            } else {
+                // These fallback cases handle TransactionStatus RPC responses from older software
+                self.confirmations.is_some() && self.confirmations.unwrap() > 1
+                    || self.confirmations.is_none()
+            }
+        } else {
+            true
+        }
+    }
+
+    // Returns `confirmation_status`, or if is_none, determines the status from confirmations.
+    // Facilitates querying nodes on older software
+    pub fn confirmation_status(&self) -> TransactionConfirmationStatus {
+        match &self.confirmation_status {
+            Some(status) => status.clone(),
+            None => {
+                if self.confirmations.is_none() {
+                    TransactionConfirmationStatus::Finalized
+                } else if self.confirmations.unwrap() > 0 {
+                    TransactionConfirmationStatus::Confirmed
+                } else {
+                    TransactionConfirmationStatus::Processed
+                }
+            }
+        }
     }
 }
 
@@ -236,6 +321,7 @@ pub struct ConfirmedTransactionStatusWithSignature {
     pub slot: Slot,
     pub err: Option<TransactionError>,
     pub memo: Option<String>,
+    pub block_time: Option<UnixTimestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -288,12 +374,13 @@ pub struct EncodedConfirmedBlock {
     pub block_time: Option<UnixTimestamp>,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmedTransaction {
     pub slot: Slot,
     #[serde(flatten)]
     pub transaction: TransactionWithStatusMeta,
+    pub block_time: Option<UnixTimestamp>,
 }
 
 impl ConfirmedTransaction {
@@ -301,6 +388,7 @@ impl ConfirmedTransaction {
         EncodedConfirmedTransaction {
             slot: self.slot,
             transaction: self.transaction.encode(encoding),
+            block_time: self.block_time,
         }
     }
 }
@@ -311,6 +399,7 @@ pub struct EncodedConfirmedTransaction {
     pub slot: Slot,
     #[serde(flatten)]
     pub transaction: EncodedTransactionWithStatusMeta,
+    pub block_time: Option<UnixTimestamp>,
 }
 
 /// A duplicate representation of a Transaction for pretty JSON serialization
@@ -465,7 +554,7 @@ impl EncodedTransaction {
         }
     }
     pub fn decode(&self) -> Option<Transaction> {
-        match self {
+        let transaction: Option<Transaction> = match self {
             EncodedTransaction::Json(_) => None,
             EncodedTransaction::LegacyBinary(blob) => bs58::decode(blob)
                 .into_vec()
@@ -483,13 +572,39 @@ impl EncodedTransaction {
                 | UiTransactionEncoding::Json
                 | UiTransactionEncoding::JsonParsed => None,
             },
-        }
+        };
+        transaction.filter(|transaction| transaction.sanitize().is_ok())
     }
+}
+
+// A serialized `Vec<TransactionByAddrInfo>` is stored in the `tx-by-addr` table.  The row keys are
+// the one's compliment of the slot so that rows may be listed in reverse order
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TransactionByAddrInfo {
+    pub signature: Signature,          // The transaction signature
+    pub err: Option<TransactionError>, // None if the transaction executed successfully
+    pub index: u32,                    // Where the transaction is located in the block
+    pub memo: Option<String>,          // Transaction memo
+    pub block_time: Option<UnixTimestamp>,
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_decode_invalid_transaction() {
+        // This transaction will not pass sanitization
+        let unsanitary_transaction = EncodedTransaction::Binary(
+            "ju9xZWuDBX4pRxX2oZkTjxU5jB4SSTgEGhX8bQ8PURNzyzqKMPPpNvWihx8zUe\
+             FfrbVNoAaEsNKZvGzAnTDy5bhNT9kt6KFCTBixpvrLCzg4M5UdFUQYrn1gdgjX\
+             pLHxcaShD81xBNaFDgnA2nkkdHnKtZt4hVSfKAmw3VRZbjrZ7L2fKZBx21CwsG\
+             hD6onjM2M3qZW5C8J6d1pj41MxKmZgPBSha3MyKkNLkAGFASK"
+                .to_string(),
+            UiTransactionEncoding::Base58,
+        );
+        assert!(unsanitary_transaction.decode().is_none());
+    }
 
     #[test]
     fn test_satisfies_commitment() {
@@ -498,19 +613,75 @@ mod test {
             confirmations: None,
             status: Ok(()),
             err: None,
+            confirmation_status: Some(TransactionConfirmationStatus::Finalized),
         };
 
-        assert!(status.satisfies_commitment(CommitmentConfig::default()));
-        assert!(status.satisfies_commitment(CommitmentConfig::recent()));
+        assert!(status.satisfies_commitment(CommitmentConfig::finalized()));
+        assert!(status.satisfies_commitment(CommitmentConfig::confirmed()));
+        assert!(status.satisfies_commitment(CommitmentConfig::processed()));
 
         let status = TransactionStatus {
             slot: 0,
             confirmations: Some(10),
             status: Ok(()),
             err: None,
+            confirmation_status: Some(TransactionConfirmationStatus::Confirmed),
         };
 
-        assert!(!status.satisfies_commitment(CommitmentConfig::default()));
-        assert!(status.satisfies_commitment(CommitmentConfig::recent()));
+        assert!(!status.satisfies_commitment(CommitmentConfig::finalized()));
+        assert!(status.satisfies_commitment(CommitmentConfig::confirmed()));
+        assert!(status.satisfies_commitment(CommitmentConfig::processed()));
+
+        let status = TransactionStatus {
+            slot: 0,
+            confirmations: Some(1),
+            status: Ok(()),
+            err: None,
+            confirmation_status: Some(TransactionConfirmationStatus::Processed),
+        };
+
+        assert!(!status.satisfies_commitment(CommitmentConfig::finalized()));
+        assert!(!status.satisfies_commitment(CommitmentConfig::confirmed()));
+        assert!(status.satisfies_commitment(CommitmentConfig::processed()));
+
+        let status = TransactionStatus {
+            slot: 0,
+            confirmations: Some(0),
+            status: Ok(()),
+            err: None,
+            confirmation_status: None,
+        };
+
+        assert!(!status.satisfies_commitment(CommitmentConfig::finalized()));
+        assert!(!status.satisfies_commitment(CommitmentConfig::confirmed()));
+        assert!(status.satisfies_commitment(CommitmentConfig::processed()));
+
+        // Test single_gossip fallback cases
+        let status = TransactionStatus {
+            slot: 0,
+            confirmations: Some(1),
+            status: Ok(()),
+            err: None,
+            confirmation_status: None,
+        };
+        assert!(!status.satisfies_commitment(CommitmentConfig::confirmed()));
+
+        let status = TransactionStatus {
+            slot: 0,
+            confirmations: Some(2),
+            status: Ok(()),
+            err: None,
+            confirmation_status: None,
+        };
+        assert!(status.satisfies_commitment(CommitmentConfig::confirmed()));
+
+        let status = TransactionStatus {
+            slot: 0,
+            confirmations: None,
+            status: Ok(()),
+            err: None,
+            confirmation_status: None,
+        };
+        assert!(status.satisfies_commitment(CommitmentConfig::confirmed()));
     }
 }

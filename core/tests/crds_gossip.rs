@@ -2,7 +2,7 @@ use bincode::serialized_size;
 use log::*;
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use serial_test_derive::serial;
+use serial_test::serial;
 use solana_core::cluster_info;
 use solana_core::contact_info::ContactInfo;
 use solana_core::crds_gossip::*;
@@ -254,7 +254,7 @@ fn network_simulator(thread_pool: &ThreadPool, network: &mut Network, max_conver
             );
         });
         // push for a bit
-        let (queue_size, bytes_tx) = network_run_push(network, start, end);
+        let (queue_size, bytes_tx) = network_run_push(thread_pool, network, start, end);
         total_bytes += bytes_tx;
         trace!(
             "network_simulator_push_{}: queue_size: {} bytes: {}",
@@ -278,7 +278,12 @@ fn network_simulator(thread_pool: &ThreadPool, network: &mut Network, max_conver
     }
 }
 
-fn network_run_push(network: &mut Network, start: usize, end: usize) -> (usize, usize) {
+fn network_run_push(
+    thread_pool: &ThreadPool,
+    network: &mut Network,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
     let mut bytes: usize = 0;
     let mut num_msgs: usize = 0;
     let mut total: usize = 0;
@@ -295,7 +300,7 @@ fn network_run_push(network: &mut Network, start: usize, end: usize) -> (usize, 
             .map(|node| {
                 let mut node_lock = node.lock().unwrap();
                 let timeouts = node_lock.make_timeouts_test();
-                node_lock.purge(now, &timeouts);
+                node_lock.purge(thread_pool, now, &timeouts);
                 node_lock.new_push_messages(vec![], now)
             })
             .collect();
@@ -341,7 +346,7 @@ fn network_run_push(network: &mut Network, start: usize, end: usize) -> (usize, 
                         network
                             .get(&from)
                             .map(|node| {
-                                let mut node = node.lock().unwrap();
+                                let node = node.lock().unwrap();
                                 let destination = node.id;
                                 let now = timestamp();
                                 node.process_prune_msg(&to, &destination, &prune_keys, now, now)
@@ -453,11 +458,18 @@ fn network_run_pull(
                         let rsp = node
                             .lock()
                             .unwrap()
-                            .generate_pull_responses(&filters, now)
+                            .generate_pull_responses(
+                                &filters,
+                                /*output_size_limit=*/ usize::MAX,
+                                now,
+                            )
                             .into_iter()
                             .flatten()
                             .collect();
-                        node.lock().unwrap().process_pull_requests(filters, now);
+                        node.lock().unwrap().process_pull_requests(
+                            filters.into_iter().map(|(caller, _)| caller),
+                            now,
+                        );
                         rsp
                     })
                     .unwrap();
@@ -490,7 +502,7 @@ fn network_run_pull(
         }
         let total: usize = network_values
             .par_iter()
-            .map(|v| v.lock().unwrap().crds.table.len())
+            .map(|v| v.lock().unwrap().crds.len())
             .sum();
         convergance = total as f64 / ((num * num) as f64);
         if convergance > max_convergance {
@@ -616,8 +628,10 @@ fn test_star_network_large_push() {
 }
 #[test]
 fn test_prune_errors() {
-    let mut crds_gossip = CrdsGossip::default();
-    crds_gossip.id = Pubkey::new(&[0; 32]);
+    let mut crds_gossip = CrdsGossip {
+        id: Pubkey::new(&[0; 32]),
+        ..CrdsGossip::default()
+    };
     let id = crds_gossip.id;
     let ci = ContactInfo::new_localhost(&Pubkey::new(&[1; 32]), 0);
     let prune_pubkey = Pubkey::new(&[2; 32]);

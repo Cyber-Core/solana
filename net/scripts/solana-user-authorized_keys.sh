@@ -65,6 +65,9 @@ SOLANA_PUBKEYS+=('ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdH
 #valverde
 SOLANA_USERS+=('buildkite-agent')
 SOLANA_PUBKEYS+=('ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNYFFHaMi+XaHzAstLgk46kvyn2/gC/f2rCCHqbgdBqHQxyxTGZc/DlAJIqd/lQZiGhHVFRW7olnIkyQJZy5FXU= buildkite-agent@valverde')
+#achilles
+SOLANA_USERS+=('buildkite-agent')
+SOLANA_PUBKEYS+=('ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOp9DIT0f3e/YJK3kCRXunrIAVxuy+5aOzP2jpSPDIzy/9/QAu9P0ZccHQRZTamMtEwB1g4MeafM8yFYzMf8XGU= buildkite-agent@achille')
 
 SOLANA_USERS+=('jstarry')
 SOLANA_PUBKEYS+=('ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCdpItheyXVow+4j1D4Y8Xh+dsS9GwFLRNiEYjvnonV3FqVO4hss6gmXPk2aiOAZc6QW3IXBt/YebWFNsxBW2xU= jstarry@Justin-Solana.local')
@@ -77,3 +80,6 @@ SOLANA_PUBKEYS+=('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEl4U9VboeYbZNOVn8SB1NM29H
 
 SOLANA_USERS+=('alexander')
 SOLANA_PUBKEYS+=('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINHM/Rdj1UtrqPWMWjgXkjr5xFkyV0yRseM/uHxlHmxe alexander@solana.com')
+
+SOLANA_USERS+=('behzad')
+SOLANA_PUBKEYS+=('ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBBalCzbx2ObVYy4OdkKi8csr4xxutk8iVhMWqLCjeSbDgyR9p6LgnDyEKLE+B0qyn3Os85ochKdnvWVopEyPjc= behzad@solana.com')

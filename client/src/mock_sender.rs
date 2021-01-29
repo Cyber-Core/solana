@@ -6,12 +6,13 @@ use crate::{
 };
 use serde_json::{json, Number, Value};
 use solana_sdk::{
+    epoch_info::EpochInfo,
     fee_calculator::{FeeCalculator, FeeRateGovernor},
     instruction::InstructionError,
     signature::Signature,
     transaction::{self, Transaction, TransactionError},
 };
-use solana_transaction_status::TransactionStatus;
+use solana_transaction_status::{TransactionConfirmationStatus, TransactionStatus};
 use solana_version::Version;
 use std::{collections::HashMap, sync::RwLock};
 
@@ -47,6 +48,10 @@ impl RpcSender for MockSender {
             return Ok(Value::Null);
         }
         let val = match request {
+            RpcRequest::GetAccountInfo => serde_json::to_value(Response {
+                context: RpcResponseContext { slot: 1 },
+                value: Value::Null,
+            })?,
             RpcRequest::GetBalance => serde_json::to_value(Response {
                 context: RpcResponseContext { slot: 1 },
                 value: Value::Number(Number::from(50)),
@@ -57,6 +62,14 @@ impl RpcSender for MockSender {
                     Value::String(PUBKEY.to_string()),
                     serde_json::to_value(FeeCalculator::default()).unwrap(),
                 ),
+            })?,
+            RpcRequest::GetEpochInfo => serde_json::to_value(EpochInfo {
+                epoch: 1,
+                slot_index: 2,
+                slots_in_epoch: 32,
+                absolute_slot: 34,
+                block_height: 34,
+                transaction_count: Some(123),
             })?,
             RpcRequest::GetFeeCalculatorForBlockhash => {
                 let value = if self.url == "blockhash_expired" {
@@ -93,6 +106,7 @@ impl RpcSender for MockSender {
                         slot: 1,
                         confirmations: None,
                         err,
+                        confirmation_status: Some(TransactionConfirmationStatus::Finalized),
                     })
                 };
                 let statuses: Vec<Option<TransactionStatus>> = params.as_array().unwrap()[0]

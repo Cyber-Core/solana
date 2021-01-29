@@ -10,7 +10,8 @@ use serde_json::{Map, Value};
 use solana_account_decoder::parse_token::UiTokenAccount;
 use solana_clap_utils::keypair::SignOnly;
 use solana_client::rpc_response::{
-    RpcAccountBalance, RpcKeyedAccount, RpcSupply, RpcVoteAccountInfo,
+    RpcAccountBalance, RpcInflationGovernor, RpcInflationRate, RpcKeyedAccount, RpcSupply,
+    RpcVoteAccountInfo,
 };
 use solana_sdk::{
     clock::{self, Epoch, Slot, UnixTimestamp},
@@ -241,6 +242,9 @@ impl fmt::Display for CliEpochInfo {
         )?;
         writeln_name_value(f, "Slot:", &self.epoch_info.absolute_slot.to_string())?;
         writeln_name_value(f, "Epoch:", &self.epoch_info.epoch.to_string())?;
+        if let Some(transaction_count) = &self.epoch_info.transaction_count {
+            writeln_name_value(f, "Transaction Count:", &transaction_count.to_string())?;
+        }
         let start_slot = self.epoch_info.absolute_slot - self.epoch_info.slot_index;
         let end_slot = start_slot + self.epoch_info.slots_in_epoch;
         writeln_name_value(
@@ -281,10 +285,7 @@ impl fmt::Display for CliEpochInfo {
 }
 
 fn slot_to_human_time(slot: Slot) -> String {
-    humantime::format_duration(Duration::from_secs(
-        slot * clock::DEFAULT_TICKS_PER_SLOT / clock::DEFAULT_TICKS_PER_SECOND,
-    ))
-    .to_string()
+    humantime::format_duration(Duration::from_millis(slot * clock::DEFAULT_MS_PER_SLOT)).to_string()
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -520,7 +521,7 @@ impl fmt::Display for CliNonceAccount {
             )
         )?;
         let nonce = self.nonce.as_deref().unwrap_or("uninitialized");
-        writeln!(f, "Nonce: {}", nonce)?;
+        writeln!(f, "Nonce blockhash: {}", nonce)?;
         if let Some(fees) = self.lamports_per_signature {
             writeln!(f, "Fee: {} lamports per signature", fees)?;
         } else {
@@ -541,7 +542,15 @@ impl CliStakeVec {
 }
 
 impl QuietDisplay for CliStakeVec {}
-impl VerboseDisplay for CliStakeVec {}
+impl VerboseDisplay for CliStakeVec {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        for state in &self.0 {
+            writeln!(w)?;
+            VerboseDisplay::write_str(state, w)?;
+        }
+        Ok(())
+    }
+}
 
 impl fmt::Display for CliStakeVec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -562,7 +571,12 @@ pub struct CliKeyedStakeState {
 }
 
 impl QuietDisplay for CliKeyedStakeState {}
-impl VerboseDisplay for CliKeyedStakeState {}
+impl VerboseDisplay for CliKeyedStakeState {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        writeln!(w, "Stake Pubkey: {}", self.stake_pubkey)?;
+        VerboseDisplay::write_str(&self.stake_state, w)
+    }
+}
 
 impl fmt::Display for CliKeyedStakeState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -579,7 +593,46 @@ pub struct CliEpochReward {
     pub amount: u64,       // lamports
     pub post_balance: u64, // lamports
     pub percent_change: f64,
-    pub apr: f64,
+    pub apr: Option<f64>,
+}
+
+fn show_votes_and_credits(
+    f: &mut fmt::Formatter,
+    votes: &[CliLockout],
+    epoch_voting_history: &[CliEpochVotingHistory],
+) -> fmt::Result {
+    if votes.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(f, "Recent Votes:")?;
+    for vote in votes {
+        writeln!(f, "- slot: {}", vote.slot)?;
+        writeln!(f, "  confirmation count: {}", vote.confirmation_count)?;
+    }
+    writeln!(f, "Epoch Voting History:")?;
+    writeln!(
+        f,
+        "* missed credits include slots unavailable to vote on due to delinquent leaders",
+    )?;
+    for entry in epoch_voting_history {
+        writeln!(
+            f, // tame fmt so that this will be folded like following
+            "- epoch: {}",
+            entry.epoch
+        )?;
+        writeln!(
+            f,
+            "  credits range: [{}..{})",
+            entry.prev_credits, entry.credits
+        )?;
+        writeln!(
+            f,
+            "  credits/slots: {}/{}",
+            entry.credits_earned, entry.slots_in_epoch
+        )?;
+    }
+    Ok(())
 }
 
 fn show_epoch_rewards(
@@ -594,19 +647,22 @@ fn show_epoch_rewards(
         writeln!(f, "Epoch Rewards:")?;
         writeln!(
             f,
-            "  {:<8}  {:<11}  {:<15}  {:<15}  {:>14}  {:>14}",
+            "  {:<6}  {:<11}  {:<16}  {:<16}  {:>14}  {:>14}",
             "Epoch", "Reward Slot", "Amount", "New Balance", "Percent Change", "APR"
         )?;
         for reward in epoch_rewards {
             writeln!(
                 f,
-                "  {:<8}  {:<11}  ◎{:<14.9}  ◎{:<14.9}  {:>13.9}%  {:>13.9}%",
+                "  {:<6}  {:<11}  ◎{:<16.9}  ◎{:<14.9}  {:>13.2}%  {}",
                 reward.epoch,
                 reward.effective_slot,
                 lamports_to_sol(reward.amount),
                 lamports_to_sol(reward.post_balance),
                 reward.percent_change,
-                reward.apr,
+                reward
+                    .apr
+                    .map(|apr| format!("{:>13.2}%", apr))
+                    .unwrap_or_default(),
             )?;
         }
     }
@@ -618,6 +674,8 @@ fn show_epoch_rewards(
 pub struct CliStakeState {
     pub stake_type: CliStakeType,
     pub account_balance: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits_observed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegated_stake: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -647,7 +705,15 @@ pub struct CliStakeState {
 }
 
 impl QuietDisplay for CliStakeState {}
-impl VerboseDisplay for CliStakeState {}
+impl VerboseDisplay for CliStakeState {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(w, "{}", self)?;
+        if let Some(credits) = self.credits_observed {
+            writeln!(w, "Credits Observed: {}", credits)?;
+        }
+        Ok(())
+    }
+}
 
 impl fmt::Display for CliStakeState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1009,24 +1075,7 @@ impl fmt::Display for CliVoteAccount {
             unix_timestamp_to_string(self.recent_timestamp.timestamp),
             self.recent_timestamp.slot
         )?;
-        if !self.votes.is_empty() {
-            writeln!(f, "Recent Votes:")?;
-            for vote in &self.votes {
-                writeln!(
-                    f,
-                    "- slot: {}\n  confirmation count: {}",
-                    vote.slot, vote.confirmation_count
-                )?;
-            }
-            writeln!(f, "Epoch Voting History:")?;
-            for epoch_info in &self.epoch_voting_history {
-                writeln!(
-                    f,
-                    "- epoch: {}\n  slots in epoch: {}\n  credits earned: {}",
-                    epoch_info.epoch, epoch_info.slots_in_epoch, epoch_info.credits_earned,
-                )?;
-            }
-        }
+        show_votes_and_credits(f, &self.votes, &self.epoch_voting_history)?;
         show_epoch_rewards(f, &self.epoch_rewards)?;
         Ok(())
     }
@@ -1065,6 +1114,8 @@ pub struct CliEpochVotingHistory {
     pub epoch: Epoch,
     pub slots_in_epoch: u64,
     pub credits_earned: u64,
+    pub credits: u64,
+    pub prev_credits: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1109,6 +1160,104 @@ impl fmt::Display for CliBlockTime {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln_name_value(f, "Block:", &self.slot.to_string())?;
         writeln_name_value(f, "Date:", &unix_timestamp_to_string(self.timestamp))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliLeaderSchedule {
+    pub epoch: Epoch,
+    pub leader_schedule_entries: Vec<CliLeaderScheduleEntry>,
+}
+
+impl QuietDisplay for CliLeaderSchedule {}
+impl VerboseDisplay for CliLeaderSchedule {}
+
+impl fmt::Display for CliLeaderSchedule {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for entry in &self.leader_schedule_entries {
+            writeln!(f, "  {:<15} {:<44}", entry.slot, entry.leader)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliLeaderScheduleEntry {
+    pub slot: Slot,
+    pub leader: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliInflation {
+    pub governor: RpcInflationGovernor,
+    pub current_rate: RpcInflationRate,
+}
+
+impl QuietDisplay for CliInflation {}
+impl VerboseDisplay for CliInflation {}
+
+impl fmt::Display for CliInflation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "{}", style("Inflation Governor:").bold())?;
+        if (self.governor.initial - self.governor.terminal).abs() < f64::EPSILON {
+            writeln!(
+                f,
+                "Fixed APR:               {:>5.2}%",
+                self.governor.terminal * 100.
+            )?;
+        } else {
+            writeln!(
+                f,
+                "Initial APR:             {:>5.2}%",
+                self.governor.initial * 100.
+            )?;
+            writeln!(
+                f,
+                "Terminal APR:            {:>5.2}%",
+                self.governor.terminal * 100.
+            )?;
+            writeln!(
+                f,
+                "Rate reduction per year: {:>5.2}%",
+                self.governor.taper * 100.
+            )?;
+        }
+        if self.governor.foundation_term > 0. {
+            writeln!(
+                f,
+                "Foundation percentage:   {:>5.2}%",
+                self.governor.foundation
+            )?;
+            writeln!(
+                f,
+                "Foundation term:         {:.1} years",
+                self.governor.foundation_term
+            )?;
+        }
+
+        writeln!(
+            f,
+            "\n{}",
+            style(format!("Inflation for Epoch {}:", self.current_rate.epoch)).bold()
+        )?;
+        writeln!(
+            f,
+            "Total APR:               {:>5.2}%",
+            self.current_rate.total * 100.
+        )?;
+        writeln!(
+            f,
+            "Staking APR:             {:>5.2}%",
+            self.current_rate.validator * 100.
+        )?;
+        writeln!(
+            f,
+            "Foundation APR:          {:>5.2}%",
+            self.current_rate.foundation * 100.
+        )
     }
 }
 

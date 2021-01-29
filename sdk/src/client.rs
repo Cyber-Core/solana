@@ -7,6 +7,8 @@
 //! Asynchronous implementations are expected to create transactions, sign them, and send
 //! them but without waiting to see if the server accepted it.
 
+#![cfg(feature = "full")]
+
 use crate::{
     account::Account,
     clock::Slot,
@@ -75,6 +77,8 @@ pub trait SyncClient {
         pubkey: &Pubkey,
         commitment_config: CommitmentConfig,
     ) -> Result<u64>;
+
+    fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> Result<u64>;
 
     /// Get recent blockhash
     fn get_recent_blockhash(&self) -> Result<(Hash, FeeCalculator)>;

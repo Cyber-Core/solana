@@ -4,7 +4,7 @@
 use crate::{
     cluster_info::ClusterInfo,
     poh_recorder::{PohRecorder, PohRecorderError, WorkingBankEntry},
-    poh_service::PohService,
+    poh_service::{self, PohService},
 };
 use crossbeam_channel::{Receiver as CrossbeamReceiver, RecvTimeoutError};
 use itertools::Itertools;
@@ -15,7 +15,7 @@ use solana_ledger::{
     leader_schedule_cache::LeaderScheduleCache,
 };
 use solana_measure::{measure::Measure, thread_mem_usage};
-use solana_metrics::{inc_new_counter_debug, inc_new_counter_info, inc_new_counter_warn};
+use solana_metrics::{inc_new_counter_debug, inc_new_counter_info};
 use solana_perf::{
     cuda_runtime::PinnedVec,
     packet::{limited_deserialize, Packet, Packets, PACKETS_PER_BATCH},
@@ -23,7 +23,10 @@ use solana_perf::{
 };
 use solana_runtime::{
     accounts_db::ErrorCounters,
-    bank::{Bank, TransactionBalancesSet, TransactionProcessResult},
+    bank::{
+        Bank, ExecuteTimings, TransactionBalancesSet, TransactionCheckResult,
+        TransactionExecutionResult,
+    },
     bank_utils,
     transaction_batch::TransactionBatch,
     vote_sender_types::ReplayVoteSender,
@@ -38,8 +41,13 @@ use solana_sdk::{
     timing::{duration_as_ms, timestamp},
     transaction::{self, Transaction, TransactionError},
 };
+use solana_transaction_status::token_balances::{
+    collect_token_balances, TransactionTokenBalancesSet,
+};
 use std::{
-    cmp, env,
+    cmp,
+    collections::HashMap,
+    env,
     net::UdpSocket,
     sync::atomic::AtomicBool,
     sync::mpsc::Receiver,
@@ -53,7 +61,7 @@ type PacketsAndOffsets = (Packets, Vec<usize>);
 pub type UnprocessedPackets = Vec<PacketsAndOffsets>;
 
 /// Transaction forwarding
-pub const FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET: u64 = 1;
+pub const FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET: u64 = 2;
 
 // Fixed thread size seems to be fastest on GCP setup
 pub const NUM_THREADS: u32 = 4;
@@ -460,7 +468,7 @@ impl BankingStage {
     fn record_transactions(
         bank_slot: Slot,
         txs: &[Transaction],
-        results: &[TransactionProcessResult],
+        results: &[TransactionExecutionResult],
         poh: &Arc<Mutex<PohRecorder>>,
     ) -> (Result<usize, PohRecorderError>, Vec<usize>) {
         let mut processed_generation = Measure::start("record::process_generation");
@@ -482,7 +490,7 @@ impl BankingStage {
         debug!("num_to_commit: {} ", num_to_commit);
         // unlock all the accounts with errors which are filtered by the above `filter_map`
         if !processed_transactions.is_empty() {
-            inc_new_counter_warn!("banking_stage-record_transactions", num_to_commit);
+            inc_new_counter_info!("banking_stage-record_transactions", num_to_commit);
 
             let mut hash_time = Measure::start("record::hash");
             let hash = hash_transactions(&processed_transactions[..]);
@@ -530,6 +538,17 @@ impl BankingStage {
         } else {
             vec![]
         };
+
+        let mut mint_decimals: HashMap<Pubkey, u8> = HashMap::new();
+
+        let pre_token_balances = if transaction_status_sender.is_some() {
+            collect_token_balances(&bank, &batch, &mut mint_decimals)
+        } else {
+            vec![]
+        };
+
+        let mut execute_timings = ExecuteTimings::default();
+
         let (
             mut loaded_accounts,
             results,
@@ -543,6 +562,7 @@ impl BankingStage {
             MAX_PROCESSING_AGE,
             transaction_status_sender.is_some(),
             transaction_status_sender.is_some(),
+            &mut execute_timings,
         );
         load_execute_time.stop();
 
@@ -569,17 +589,20 @@ impl BankingStage {
                 &results,
                 tx_count,
                 signature_count,
+                &mut execute_timings,
             );
 
             bank_utils::find_and_send_votes(txs, &tx_results, Some(gossip_vote_sender));
             if let Some(sender) = transaction_status_sender {
                 let post_balances = bank.collect_balances(batch);
+                let post_token_balances = collect_token_balances(&bank, &batch, &mut mint_decimals);
                 send_transaction_status_batch(
                     bank.clone(),
                     batch.transactions(),
                     batch.iteration_order_vec(),
-                    tx_results.processing_results,
+                    tx_results.execution_results,
                     TransactionBalancesSet::new(pre_balances, post_balances),
+                    TransactionTokenBalancesSet::new(pre_token_balances, post_token_balances),
                     inner_instructions,
                     transaction_logs,
                     sender,
@@ -719,7 +742,7 @@ impl BankingStage {
     // This function returns a vector containing index of all valid transactions. A valid
     // transaction has result Ok() as the value
     fn filter_valid_transaction_indexes(
-        valid_txs: &[TransactionProcessResult],
+        valid_txs: &[TransactionCheckResult],
         transaction_indexes: &[usize],
     ) -> Vec<usize> {
         let valid_transactions = valid_txs
@@ -1072,7 +1095,13 @@ pub fn create_test_recorder(
     poh_recorder.set_bank(&bank);
 
     let poh_recorder = Arc::new(Mutex::new(poh_recorder));
-    let poh_service = PohService::new(poh_recorder.clone(), &poh_config, &exit);
+    let poh_service = PohService::new(
+        poh_recorder.clone(),
+        &poh_config,
+        &exit,
+        bank.ticks_per_slot(),
+        poh_service::DEFAULT_PINNED_CPU_CORE,
+    );
 
     (exit, poh_recorder, poh_service, entry_receiver)
 }
@@ -1092,8 +1121,7 @@ mod tests {
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
         get_tmp_ledger_path,
     };
-    use solana_perf::packet::to_packets;
-    use solana_runtime::bank::HashAgeKind;
+    use solana_perf::packet::to_packets_chunked;
     use solana_sdk::{
         instruction::InstructionError,
         signature::{Keypair, Signer},
@@ -1156,8 +1184,10 @@ mod tests {
                 Blockstore::open(&ledger_path)
                     .expect("Expected to be able to open database ledger"),
             );
-            let mut poh_config = PohConfig::default();
-            poh_config.target_tick_count = Some(bank.max_tick_height() + num_extra_ticks);
+            let poh_config = PohConfig {
+                target_tick_count: Some(bank.max_tick_height() + num_extra_ticks),
+                ..PohConfig::default()
+            };
             let (exit, poh_recorder, poh_service, entry_receiver) =
                 create_test_recorder(&bank, &blockstore, Some(poh_config));
             let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
@@ -1221,9 +1251,12 @@ mod tests {
                 Blockstore::open(&ledger_path)
                     .expect("Expected to be able to open database ledger"),
             );
-            let mut poh_config = PohConfig::default();
-            // limit tick count to avoid clearing working_bank at PohRecord then PohRecorderError(MaxHeightReached) at BankingStage
-            poh_config.target_tick_count = Some(bank.max_tick_height() - 1);
+            let poh_config = PohConfig {
+                // limit tick count to avoid clearing working_bank at PohRecord then
+                // PohRecorderError(MaxHeightReached) at BankingStage
+                target_tick_count: Some(bank.max_tick_height() - 1),
+                ..PohConfig::default()
+            };
             let (exit, poh_recorder, poh_service, entry_receiver) =
                 create_test_recorder(&bank, &blockstore, Some(poh_config));
             let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
@@ -1259,7 +1292,7 @@ mod tests {
             let tx_anf = system_transaction::transfer(&keypair, &to3, 1, start_hash);
 
             // send 'em over
-            let packets = to_packets(&[tx_no_ver, tx_anf, tx]);
+            let packets = to_packets_chunked(&[tx_no_ver, tx_anf, tx], 3);
 
             // glad they all fit
             assert_eq!(packets.len(), 1);
@@ -1335,7 +1368,7 @@ mod tests {
         let tx =
             system_transaction::transfer(&mint_keypair, &alice.pubkey(), 2, genesis_config.hash());
 
-        let packets = to_packets(&[tx]);
+        let packets = to_packets_chunked(&[tx], 1);
         let packets = packets
             .into_iter()
             .map(|packets| (packets, vec![1u8]))
@@ -1346,7 +1379,7 @@ mod tests {
         // Process a second batch that uses the same from account, so conflicts with above TX
         let tx =
             system_transaction::transfer(&mint_keypair, &alice.pubkey(), 1, genesis_config.hash());
-        let packets = to_packets(&[tx]);
+        let packets = to_packets_chunked(&[tx], 1);
         let packets = packets
             .into_iter()
             .map(|packets| (packets, vec![1u8]))
@@ -1366,9 +1399,12 @@ mod tests {
                     Blockstore::open(&ledger_path)
                         .expect("Expected to be able to open database ledger"),
                 );
-                let mut poh_config = PohConfig::default();
-                // limit tick count to avoid clearing working_bank at PohRecord then PohRecorderError(MaxHeightReached) at BankingStage
-                poh_config.target_tick_count = Some(bank.max_tick_height() - 1);
+                let poh_config = PohConfig {
+                    // limit tick count to avoid clearing working_bank at
+                    // PohRecord then PohRecorderError(MaxHeightReached) at BankingStage
+                    target_tick_count: Some(bank.max_tick_height() - 1),
+                    ..PohConfig::default()
+                };
                 let (exit, poh_recorder, poh_service, entry_receiver) =
                     create_test_recorder(&bank, &blockstore, Some(poh_config));
                 let cluster_info =
@@ -1457,10 +1493,7 @@ mod tests {
                 system_transaction::transfer(&keypair2, &pubkey2, 1, genesis_config.hash()),
             ];
 
-            let mut results = vec![
-                (Ok(()), Some(HashAgeKind::Extant)),
-                (Ok(()), Some(HashAgeKind::Extant)),
-            ];
+            let mut results = vec![(Ok(()), None), (Ok(()), None)];
             let _ = BankingStage::record_transactions(
                 bank.slot(),
                 &transactions,
@@ -1476,7 +1509,7 @@ mod tests {
                     1,
                     SystemError::ResultWithNegativeLamports.into(),
                 )),
-                Some(HashAgeKind::Extant),
+                None,
             );
             let (res, retryable) = BankingStage::record_transactions(
                 bank.slot(),
@@ -1652,10 +1685,10 @@ mod tests {
                 &[
                     (Err(TransactionError::BlockhashNotFound), None),
                     (Err(TransactionError::BlockhashNotFound), None),
-                    (Ok(()), Some(HashAgeKind::Extant)),
+                    (Ok(()), None),
                     (Err(TransactionError::BlockhashNotFound), None),
-                    (Ok(()), Some(HashAgeKind::Extant)),
-                    (Ok(()), Some(HashAgeKind::Extant)),
+                    (Ok(()), None),
+                    (Ok(()), None),
                 ],
                 &[2, 4, 5, 9, 11, 13]
             ),
@@ -1665,12 +1698,12 @@ mod tests {
         assert_eq!(
             BankingStage::filter_valid_transaction_indexes(
                 &[
-                    (Ok(()), Some(HashAgeKind::Extant)),
+                    (Ok(()), None),
                     (Err(TransactionError::BlockhashNotFound), None),
                     (Err(TransactionError::BlockhashNotFound), None),
-                    (Ok(()), Some(HashAgeKind::Extant)),
-                    (Ok(()), Some(HashAgeKind::Extant)),
-                    (Ok(()), Some(HashAgeKind::Extant)),
+                    (Ok(()), None),
+                    (Ok(()), None),
+                    (Ok(()), None),
                 ],
                 &[1, 6, 7, 9, 31, 43]
             ),
@@ -1961,7 +1994,7 @@ mod tests {
 
             assert_eq!(processed_transactions_count, 0,);
 
-            retryable_txs.sort();
+            retryable_txs.sort_unstable();
             let expected: Vec<usize> = (0..transactions.len()).collect();
             assert_eq!(retryable_txs, expected);
         }

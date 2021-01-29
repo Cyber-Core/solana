@@ -2,11 +2,14 @@ use crate::parse_instruction::{
     check_num_accounts, ParsableProgram, ParseInstructionError, ParsedInstructionEnum,
 };
 use serde_json::{json, Map, Value};
-use solana_account_decoder::parse_token::token_amount_to_ui_amount;
-use solana_sdk::{instruction::CompiledInstruction, pubkey::Pubkey};
+use solana_account_decoder::parse_token::{pubkey_from_spl_token_v2_0, token_amount_to_ui_amount};
+use solana_sdk::{
+    instruction::{AccountMeta, CompiledInstruction, Instruction},
+    pubkey::Pubkey,
+};
 use spl_token_v2_0::{
     instruction::{AuthorityType, TokenInstruction},
-    solana_sdk::program_option::COption,
+    solana_program::{instruction::Instruction as SplTokenInstruction, program_option::COption},
 };
 
 pub fn parse_token(
@@ -410,13 +413,29 @@ fn check_num_token_accounts(accounts: &[u8], num: usize) -> Result<(), ParseInst
     check_num_accounts(accounts, num, ParsableProgram::SplToken)
 }
 
+pub fn spl_token_v2_0_instruction(instruction: SplTokenInstruction) -> Instruction {
+    Instruction {
+        program_id: pubkey_from_spl_token_v2_0(&instruction.program_id),
+        accounts: instruction
+            .accounts
+            .iter()
+            .map(|meta| AccountMeta {
+                pubkey: pubkey_from_spl_token_v2_0(&meta.pubkey),
+                is_signer: meta.is_signer,
+                is_writable: meta.is_writable,
+            })
+            .collect(),
+        data: instruction.data,
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use solana_sdk::instruction::CompiledInstruction;
     use spl_token_v2_0::{
         instruction::*,
-        solana_sdk::{
+        solana_program::{
             instruction::CompiledInstruction as SplTokenCompiledInstruction, message::Message,
             pubkey::Pubkey as SplTokenPubkey,
         },

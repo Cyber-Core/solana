@@ -28,6 +28,7 @@ gpuMode="${19:-auto}"
 maybeWarpSlot="${20}"
 waitForNodeInit="${21}"
 extraPrimordialStakes="${22:=0}"
+tmpfsAccounts="${23:false}"
 set +x
 
 missing() {
@@ -225,6 +226,7 @@ EOF
       if [[ -f net/keypairs/bootstrap-validator-identity.json ]]; then
         export BOOTSTRAP_VALIDATOR_IDENTITY_KEYPAIR=net/keypairs/bootstrap-validator-identity.json
       fi
+      echo "remote-node.sh: Primordial stakes: $extraPrimordialStakes"
       if [[ "$extraPrimordialStakes" -gt 0 ]]; then
         if [[ "$extraPrimordialStakes" -gt "$numNodes" ]]; then
           echo "warning: extraPrimordialStakes($extraPrimordialStakes) clamped to numNodes($numNodes)"
@@ -274,6 +276,10 @@ EOF
       --init-complete-file "$initCompleteFile"
     )
 
+    if [[ "$tmpfsAccounts" = "true" ]]; then
+      args+=(--accounts /mnt/solana-accounts)
+    fi
+
     if [[ $airdropsEnabled = true ]]; then
 cat >> ~/solana/on-reboot <<EOF
       ./multinode-demo/faucet.sh > faucet.log 2>&1 &
@@ -305,30 +311,30 @@ EOF
 
       if [[ $nodeType = blockstreamer ]]; then
         net/scripts/rsync-retry.sh -vPrc \
-          "$entrypointIp":~/solana/config/blockstreamer-identity.json config/validator-identity.json
+          "$entrypointIp":~/solana/config/blockstreamer-identity.json "$SOLANA_CONFIG_DIR"/validator-identity.json
       else
         net/scripts/rsync-retry.sh -vPrc \
-          "$entrypointIp":~/solana/config/validator-identity-"$nodeIndex".json config/validator-identity.json
+          "$entrypointIp":~/solana/config/validator-identity-"$nodeIndex".json "$SOLANA_CONFIG_DIR"/validator-identity.json
         net/scripts/rsync-retry.sh -vPrc \
-          "$entrypointIp":~/solana/config/validator-stake-"$nodeIndex".json config/stake-account.json
+          "$entrypointIp":~/solana/config/validator-stake-"$nodeIndex".json "$SOLANA_CONFIG_DIR"/stake-account.json
         net/scripts/rsync-retry.sh -vPrc \
-          "$entrypointIp":~/solana/config/validator-vote-"$nodeIndex".json config/vote-account.json
+          "$entrypointIp":~/solana/config/validator-vote-"$nodeIndex".json "$SOLANA_CONFIG_DIR"/vote-account.json
       fi
       net/scripts/rsync-retry.sh -vPrc \
-        "$entrypointIp":~/solana/config/shred-version config/shred-version
+        "$entrypointIp":~/solana/config/shred-version "$SOLANA_CONFIG_DIR"/shred-version
 
       net/scripts/rsync-retry.sh -vPrc \
-        "$entrypointIp":~/solana/config/bank-hash config/bank-hash || true
+        "$entrypointIp":~/solana/config/bank-hash "$SOLANA_CONFIG_DIR"/bank-hash || true
 
       net/scripts/rsync-retry.sh -vPrc \
-        "$entrypointIp":~/solana/config/faucet.json config/faucet.json
+        "$entrypointIp":~/solana/config/faucet.json "$SOLANA_CONFIG_DIR"/faucet.json
     fi
 
     args=(
       --entrypoint "$entrypointIp:8001"
       --gossip-port 8001
       --rpc-port 8899
-      --expected-shred-version "$(cat config/shred-version)"
+      --expected-shred-version "$(cat "$SOLANA_CONFIG_DIR"/shred-version)"
     )
     if [[ $nodeType = blockstreamer ]]; then
       args+=(
@@ -343,27 +349,27 @@ EOF
       fi
     fi
 
-    if [[ ! -f config/validator-identity.json ]]; then
-      solana-keygen new --no-passphrase -so config/validator-identity.json
+    if [[ ! -f "$SOLANA_CONFIG_DIR"/validator-identity.json ]]; then
+      solana-keygen new --no-passphrase -so "$SOLANA_CONFIG_DIR"/validator-identity.json
     fi
-    args+=(--identity config/validator-identity.json)
-    if [[ ! -f config/vote-account.json ]]; then
-      solana-keygen new --no-passphrase -so config/vote-account.json
+    args+=(--identity "$SOLANA_CONFIG_DIR"/validator-identity.json)
+    if [[ ! -f "$SOLANA_CONFIG_DIR"/vote-account.json ]]; then
+      solana-keygen new --no-passphrase -so "$SOLANA_CONFIG_DIR"/vote-account.json
     fi
-    args+=(--vote-account config/vote-account.json)
+    args+=(--vote-account "$SOLANA_CONFIG_DIR"/vote-account.json)
 
     if [[ $airdropsEnabled != true ]]; then
       args+=(--no-airdrop)
     fi
 
-    if [[ -r config/bank-hash ]]; then
-      args+=(--expected-bank-hash "$(cat config/bank-hash)")
+    if [[ -r "$SOLANA_CONFIG_DIR"/bank-hash ]]; then
+      args+=(--expected-bank-hash "$(cat "$SOLANA_CONFIG_DIR"/bank-hash)")
     fi
 
     set -x
     # Add the faucet keypair to validators for convenient access from tools
     # like bench-tps and add to blocktreamers to run a faucet
-    scp "$entrypointIp":~/solana/config/faucet.json config/
+    scp "$entrypointIp":~/solana/config/faucet.json "$SOLANA_CONFIG_DIR"/
     if [[ $nodeType = blockstreamer ]]; then
       # Run another faucet with the same keypair on the blockstreamer node.
       # Typically the blockstreamer node has a static IP/DNS name for hosting
@@ -389,6 +395,10 @@ EOF
     maybeSkipAccountsCreation=
     if [[ $nodeIndex -le $extraPrimordialStakes ]]; then
       maybeSkipAccountsCreation="export SKIP_ACCOUNTS_CREATION=1"
+    fi
+
+    if [[ "$tmpfsAccounts" = "true" ]]; then
+      args+=(--accounts /mnt/solana-accounts)
     fi
 
 cat >> ~/solana/on-reboot <<EOF
@@ -419,8 +429,13 @@ EOF
         args+=(--keypair config/validator-identity.json)
       fi
 
-      if [[ ${#extraPrimordialStakes} -eq 0 ]]; then
-        multinode-demo/delegate-stake.sh "${args[@]}" "$internalNodesStakeLamports"
+      if [[ ${extraPrimordialStakes} -eq 0 ]]; then
+        echo "0 Primordial stakes, staking with $internalNodesStakeLamports"
+        multinode-demo/delegate-stake.sh --vote-account "$SOLANA_CONFIG_DIR"/vote-account.json \
+                                         --stake-account "$SOLANA_CONFIG_DIR"/stake-account.json \
+                                         "${args[@]}" "$internalNodesStakeLamports"
+      else
+        echo "Skipping staking with extra stakes: ${extraPrimordialStakes}"
       fi
     fi
     ;;

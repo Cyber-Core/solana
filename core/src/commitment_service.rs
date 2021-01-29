@@ -113,7 +113,17 @@ impl AggregateCommitmentService {
                     "aggregate-commitment-ms",
                     aggregate_commitment_time.as_ms() as i64,
                     i64
-                )
+                ),
+                (
+                    "highest-confirmed-root",
+                    update_commitment_slots.highest_confirmed_root as i64,
+                    i64
+                ),
+                (
+                    "highest-confirmed-slot",
+                    update_commitment_slots.highest_confirmed_slot as i64,
+                    i64
+                ),
             );
 
             // Triggers rpc_subscription notifications as soon as new commitment data is available,
@@ -176,19 +186,15 @@ impl AggregateCommitmentService {
             if lamports == 0 {
                 continue;
             }
-            let vote_state = VoteState::from(&account);
-            if vote_state.is_none() {
-                continue;
+            if let Ok(vote_state) = account.vote_state().as_ref() {
+                Self::aggregate_commitment_for_vote_account(
+                    &mut commitment,
+                    &mut rooted_stake,
+                    vote_state,
+                    ancestors,
+                    lamports,
+                );
             }
-
-            let vote_state = vote_state.unwrap();
-            Self::aggregate_commitment_for_vote_account(
-                &mut commitment,
-                &mut rooted_stake,
-                &vote_state,
-                ancestors,
-                lamports,
-            );
         }
 
         (commitment, rooted_stake)
@@ -243,6 +249,7 @@ mod tests {
     use super::*;
     use solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo};
     use solana_runtime::{
+        accounts_background_service::ABSRequestSender,
         bank_forks::BankForks,
         genesis_utils::{create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs},
     };
@@ -256,15 +263,9 @@ mod tests {
     #[test]
     fn test_get_highest_confirmed_root() {
         assert_eq!(get_highest_confirmed_root(vec![], 10), 0);
-        let mut rooted_stake = vec![];
-        rooted_stake.push((0, 5));
-        rooted_stake.push((1, 5));
+        let rooted_stake = vec![(0, 5), (1, 5)];
         assert_eq!(get_highest_confirmed_root(rooted_stake, 10), 0);
-        let mut rooted_stake = vec![];
-        rooted_stake.push((1, 5));
-        rooted_stake.push((0, 10));
-        rooted_stake.push((2, 5));
-        rooted_stake.push((1, 4));
+        let rooted_stake = vec![(1, 5), (0, 10), (2, 5), (1, 4)];
         assert_eq!(get_highest_confirmed_root(rooted_stake, 10), 1);
     }
 
@@ -427,26 +428,26 @@ mod tests {
         let mut vote_state1 = VoteState::from(&vote_account1).unwrap();
         vote_state1.process_slot_vote_unchecked(3);
         vote_state1.process_slot_vote_unchecked(5);
-        let versioned = VoteStateVersions::Current(Box::new(vote_state1));
+        let versioned = VoteStateVersions::new_current(vote_state1);
         VoteState::to(&versioned, &mut vote_account1).unwrap();
         bank.store_account(&pk1, &vote_account1);
 
         let mut vote_state2 = VoteState::from(&vote_account2).unwrap();
         vote_state2.process_slot_vote_unchecked(9);
         vote_state2.process_slot_vote_unchecked(10);
-        let versioned = VoteStateVersions::Current(Box::new(vote_state2));
+        let versioned = VoteStateVersions::new_current(vote_state2);
         VoteState::to(&versioned, &mut vote_account2).unwrap();
         bank.store_account(&pk2, &vote_account2);
 
         let mut vote_state3 = VoteState::from(&vote_account3).unwrap();
         vote_state3.root_slot = Some(1);
-        let versioned = VoteStateVersions::Current(Box::new(vote_state3));
+        let versioned = VoteStateVersions::new_current(vote_state3);
         VoteState::to(&versioned, &mut vote_account3).unwrap();
         bank.store_account(&pk3, &vote_account3);
 
         let mut vote_state4 = VoteState::from(&vote_account4).unwrap();
         vote_state4.root_slot = Some(2);
-        let versioned = VoteStateVersions::Current(Box::new(vote_state4));
+        let versioned = VoteStateVersions::new_current(vote_state4);
         VoteState::to(&versioned, &mut vote_account4).unwrap();
         bank.store_account(&pk4, &vote_account4);
 
@@ -482,9 +483,14 @@ mod tests {
     #[test]
     fn test_highest_confirmed_root_advance() {
         fn get_vote_account_root_slot(vote_pubkey: Pubkey, bank: &Arc<Bank>) -> Slot {
-            let account = &bank.vote_accounts()[&vote_pubkey].1;
-            let vote_state = VoteState::from(account).unwrap();
-            vote_state.root_slot.unwrap()
+            let (_stake, vote_account) = bank.get_vote_account(&vote_pubkey).unwrap();
+            let slot = vote_account
+                .vote_state()
+                .as_ref()
+                .unwrap()
+                .root_slot
+                .unwrap();
+            slot
         }
 
         let block_commitment_cache = RwLock::new(BlockCommitmentCache::new_for_tests());
@@ -528,7 +534,7 @@ mod tests {
             &working_bank,
         );
         for x in 0..root {
-            bank_forks.set_root(x, &None, None);
+            bank_forks.set_root(x, &ABSRequestSender::default(), None);
         }
 
         // Add an additional bank/vote that will root slot 2
@@ -565,7 +571,11 @@ mod tests {
             .read()
             .unwrap()
             .highest_confirmed_root();
-        bank_forks.set_root(root, &None, Some(highest_confirmed_root));
+        bank_forks.set_root(
+            root,
+            &ABSRequestSender::default(),
+            Some(highest_confirmed_root),
+        );
         let highest_confirmed_root_bank = bank_forks.get(highest_confirmed_root);
         assert!(highest_confirmed_root_bank.is_some());
 
@@ -630,7 +640,11 @@ mod tests {
             .read()
             .unwrap()
             .highest_confirmed_root();
-        bank_forks.set_root(root, &None, Some(highest_confirmed_root));
+        bank_forks.set_root(
+            root,
+            &ABSRequestSender::default(),
+            Some(highest_confirmed_root),
+        );
         let highest_confirmed_root_bank = bank_forks.get(highest_confirmed_root);
         assert!(highest_confirmed_root_bank.is_some());
     }

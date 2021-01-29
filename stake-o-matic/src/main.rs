@@ -27,7 +27,6 @@ use std::{
     collections::{HashMap, HashSet},
     error,
     fs::File,
-    iter::FromIterator,
     path::PathBuf,
     process,
     str::FromStr,
@@ -65,7 +64,10 @@ struct Config {
     delinquent_grace_slot_distance: u64,
 
     /// Don't ever unstake more than this percentage of the cluster at one time
-    max_poor_block_productor_percentage: usize,
+    max_poor_block_producer_percentage: usize,
+
+    /// Vote accounts with a larger commission than this amount will not be staked.
+    max_commission: u8,
 
     address_labels: HashMap<String, String>,
 }
@@ -95,7 +97,6 @@ fn get_config() -> Config {
                 .takes_value(true)
                 .validator(is_url)
                 .help("JSON RPC URL for the cluster")
-                .conflicts_with("cluster")
         )
         .arg(
             Arg::with_name("cluster")
@@ -147,6 +148,15 @@ fn get_config() -> Config {
                 .help("Quality validators produce a block in at least this percentage of their leader slots over the previous epoch")
         )
         .arg(
+            Arg::with_name("max_poor_block_producer_percentage")
+                .long("max-poor-block-producer-percentage")
+                .value_name("PERCENTAGE")
+                .takes_value(true)
+                .default_value("20")
+                .validator(is_valid_percentage)
+                .help("Do not add or remove bonus stake from any non-delinquent validators if at least this percentage of all validators are poor block producers")
+        )
+        .arg(
             Arg::with_name("baseline_stake_amount")
                 .long("baseline-stake-amount")
                 .value_name("SOL")
@@ -162,6 +172,15 @@ fn get_config() -> Config {
                 .default_value("50000")
                 .validator(is_amount)
         )
+        .arg(
+            Arg::with_name("max_commission")
+                .long("max-commission")
+                .value_name("PERCENTAGE")
+                .takes_value(true)
+                .default_value("100")
+                .validator(is_valid_percentage)
+                .help("Vote accounts with a larger commission than this amount will not be staked")
+        )
         .get_matches();
 
     let config = if let Some(config_file) = matches.value_of("config_file") {
@@ -176,17 +195,22 @@ fn get_config() -> Config {
     let cluster = value_t!(matches, "cluster", String).unwrap_or_else(|_| "unknown".into());
     let quality_block_producer_percentage =
         value_t_or_exit!(matches, "quality_block_producer_percentage", usize);
+    let max_commission = value_t_or_exit!(matches, "max_commission", u8);
+    let max_poor_block_producer_percentage =
+        value_t_or_exit!(matches, "max_poor_block_producer_percentage", usize);
     let baseline_stake_amount =
         sol_to_lamports(value_t_or_exit!(matches, "baseline_stake_amount", f64));
     let bonus_stake_amount = sol_to_lamports(value_t_or_exit!(matches, "bonus_stake_amount", f64));
 
     let (json_rpc_url, validator_list) = match cluster.as_str() {
         "mainnet-beta" => (
-            "http://api.mainnet-beta.solana.com".into(),
+            value_t!(matches, "json_rpc_url", String)
+                .unwrap_or_else(|_| "http://api.mainnet-beta.solana.com".into()),
             validator_list::mainnet_beta_validators(),
         ),
         "testnet" => (
-            "http://testnet.solana.com".into(),
+            value_t!(matches, "json_rpc_url", String)
+                .unwrap_or_else(|_| "http://testnet.solana.com".into()),
             validator_list::testnet_validators(),
         ),
         "unknown" => {
@@ -231,7 +255,8 @@ fn get_config() -> Config {
         bonus_stake_amount,
         delinquent_grace_slot_distance: 21600, // ~24 hours worth of slots at 2.5 slots per second
         quality_block_producer_percentage,
-        max_poor_block_productor_percentage: 20,
+        max_commission,
+        max_poor_block_producer_percentage,
         address_labels: config.address_labels,
     };
 
@@ -270,6 +295,28 @@ fn get_stake_account(
         .map(|stake_state| (account.lamports, stake_state))
 }
 
+fn retry_rpc_operation<T, F>(mut retries: usize, op: F) -> client_error::Result<T>
+where
+    F: Fn() -> client_error::Result<T>,
+{
+    loop {
+        let result = op();
+
+        if let Err(client_error::ClientError {
+            kind: client_error::ClientErrorKind::Reqwest(ref reqwest_error),
+            ..
+        }) = result
+        {
+            if reqwest_error.is_timeout() && retries > 0 {
+                info!("RPC request timeout, {} retries remaining", retries);
+                retries -= 1;
+                continue;
+            }
+        }
+        return result;
+    }
+}
+
 /// Split validators into quality/poor lists based on their block production over the given `epoch`
 fn classify_block_producers(
     rpc_client: &RpcClient,
@@ -280,28 +327,61 @@ fn classify_block_producers(
     let first_slot_in_epoch = epoch_schedule.get_first_slot_in_epoch(epoch);
     let last_slot_in_epoch = epoch_schedule.get_last_slot_in_epoch(epoch);
 
+    let first_available_block = rpc_client.get_first_available_block()?;
     let minimum_ledger_slot = rpc_client.minimum_ledger_slot()?;
-    if minimum_ledger_slot >= last_slot_in_epoch {
+    debug!(
+        "first_available_block: {}, minimum_ledger_slot: {}",
+        first_available_block, minimum_ledger_slot
+    );
+
+    if first_available_block >= last_slot_in_epoch {
         return Err(format!(
-            "Minimum ledger slot is newer than the last epoch: {} > {}",
-            minimum_ledger_slot, last_slot_in_epoch
+            "First available block is newer than the last epoch: {} > {}",
+            first_available_block, last_slot_in_epoch
         )
         .into());
     }
 
-    let first_slot = if minimum_ledger_slot > first_slot_in_epoch {
-        minimum_ledger_slot
+    let first_slot = if first_available_block > first_slot_in_epoch {
+        first_available_block
     } else {
         first_slot_in_epoch
     };
 
-    let confirmed_blocks = rpc_client.get_confirmed_blocks(first_slot, Some(last_slot_in_epoch))?;
-    let confirmed_blocks: HashSet<Slot> = HashSet::from_iter(confirmed_blocks.into_iter());
+    let leader_schedule = rpc_client.get_leader_schedule(Some(first_slot))?.unwrap();
+
+    let mut confirmed_blocks = vec![];
+    // Fetching a large number of blocks from BigTable can cause timeouts, break up the requests
+    const LONGTERM_STORAGE_STEP: u64 = 5_000;
+    let mut next_slot = first_slot;
+    while next_slot < last_slot_in_epoch {
+        let last_slot = if next_slot >= minimum_ledger_slot {
+            last_slot_in_epoch
+        } else {
+            last_slot_in_epoch.min(next_slot + LONGTERM_STORAGE_STEP)
+        };
+        let slots_remaining = last_slot_in_epoch - last_slot;
+        info!(
+            "Fetching confirmed blocks between {} - {}{}",
+            next_slot,
+            last_slot,
+            if slots_remaining > 0 {
+                format!(" ({} remaining)", slots_remaining)
+            } else {
+                "".to_string()
+            }
+        );
+
+        confirmed_blocks.push(retry_rpc_operation(42, || {
+            rpc_client.get_confirmed_blocks(next_slot, Some(last_slot))
+        })?);
+        next_slot = last_slot + 1;
+    }
+    let confirmed_blocks: HashSet<Slot> = confirmed_blocks.into_iter().flatten().collect();
 
     let mut poor_block_producers = HashSet::new();
     let mut quality_block_producers = HashSet::new();
 
-    let leader_schedule = rpc_client.get_leader_schedule(Some(first_slot))?.unwrap();
     for (validator_identity, relative_slots) in leader_schedule {
         let mut validator_blocks = 0;
         let mut validator_slots = 0;
@@ -383,16 +463,11 @@ fn simulate_transactions(
     rpc_client: &RpcClient,
     candidate_transactions: Vec<(Transaction, String)>,
 ) -> client_error::Result<Vec<(Transaction, String)>> {
-    let (blockhash, _fee_calculator) = rpc_client.get_recent_blockhash()?;
-
-    info!(
-        "Simulating {} transactions with blockhash {}",
-        candidate_transactions.len(),
-        blockhash
-    );
+    info!("Simulating {} transactions", candidate_transactions.len(),);
     let mut simulated_transactions = vec![];
     for (mut transaction, memo) in candidate_transactions {
-        transaction.message.recent_blockhash = blockhash;
+        transaction.message.recent_blockhash =
+            retry_rpc_operation(10, || rpc_client.get_recent_blockhash())?.0;
 
         let sim_result = rpc_client.simulate_transaction_with_config(
             &transaction,
@@ -431,7 +506,7 @@ fn transact(
     );
 
     let (blockhash, fee_calculator, last_valid_slot) = rpc_client
-        .get_recent_blockhash_with_commitment(CommitmentConfig::max())?
+        .get_recent_blockhash_with_commitment(rpc_client.commitment())?
         .value;
     info!("{} transactions to send", transactions.len());
 
@@ -459,7 +534,7 @@ fn transact(
             break;
         }
 
-        let slot = rpc_client.get_slot_with_commitment(CommitmentConfig::max())?;
+        let slot = rpc_client.get_slot_with_commitment(CommitmentConfig::finalized())?;
         info!(
             "Current slot={}, last_valid_slot={} (slots remaining: {}) ",
             slot,
@@ -566,6 +641,11 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let notifier = Notifier::default();
     let rpc_client = RpcClient::new(config.json_rpc_url.clone());
 
+    if !config.dry_run && notifier.is_empty() {
+        error!("A notifier must be active with --confirm");
+        process::exit(1);
+    }
+
     let source_stake_balance = validate_source_stake_account(&rpc_client, &config)?;
 
     let epoch_info = rpc_client.get_epoch_info()?;
@@ -577,7 +657,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         classify_block_producers(&rpc_client, &config, last_epoch)?;
 
     let too_many_poor_block_producers = poor_block_producers.len()
-        > quality_block_producers.len() * config.max_poor_block_productor_percentage / 100;
+        > quality_block_producers.len() * config.max_poor_block_producer_percentage / 100;
 
     // Fetch vote account status for all the validator_listed validators
     let vote_account_status = rpc_client.get_vote_accounts()?;
@@ -601,9 +681,10 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let mut stake_activated_in_current_epoch: HashSet<Pubkey> = HashSet::new();
 
     for RpcVoteAccountInfo {
-        vote_pubkey,
+        commission,
         node_pubkey,
         root_slot,
+        vote_pubkey,
         ..
     } in &vote_account_info
     {
@@ -629,7 +710,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         // Transactions to create the baseline and bonus stake accounts
         if let Ok((balance, stake_state)) = get_stake_account(&rpc_client, &baseline_stake_address)
         {
-            if balance != config.baseline_stake_amount {
+            if balance <= config.baseline_stake_amount {
                 info!(
                     "Unexpected balance in stake account {}: {}, expected {}",
                     baseline_stake_address, balance, config.baseline_stake_amount
@@ -666,7 +747,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         }
 
         if let Ok((balance, stake_state)) = get_stake_account(&rpc_client, &bonus_stake_address) {
-            if balance != config.bonus_stake_amount {
+            if balance <= config.bonus_stake_amount {
                 info!(
                     "Unexpected balance in stake account {}: {}, expected {}",
                     bonus_stake_address, balance, config.bonus_stake_amount
@@ -702,9 +783,46 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             ));
         }
 
+        if *commission > config.max_commission {
+            // Deactivate baseline stake
+            delegate_stake_transactions.push((
+                Transaction::new_unsigned(Message::new(
+                    &[stake_instruction::deactivate_stake(
+                        &baseline_stake_address,
+                        &config.authorized_staker.pubkey(),
+                    )],
+                    Some(&config.authorized_staker.pubkey()),
+                )),
+                format!(
+                    "⛔ `{}` commission of {}% is too high. Max commission is {}%. Removed ◎{} baseline stake",
+                    formatted_node_pubkey,
+                    commission,
+                    config.max_commission,
+                    lamports_to_sol(config.baseline_stake_amount),
+                ),
+            ));
+
+            // Deactivate bonus stake
+            delegate_stake_transactions.push((
+                Transaction::new_unsigned(Message::new(
+                    &[stake_instruction::deactivate_stake(
+                        &bonus_stake_address,
+                        &config.authorized_staker.pubkey(),
+                    )],
+                    Some(&config.authorized_staker.pubkey()),
+                )),
+                format!(
+                    "⛔ `{}` commission of {}% is too high. Max commission is {}%. Removed ◎{} bonus stake",
+                    formatted_node_pubkey,
+                    commission,
+                    config.max_commission,
+                    lamports_to_sol(config.bonus_stake_amount),
+                ),
+            ));
+
         // Validator is not considered delinquent if its root slot is less than 256 slots behind the current
         // slot.  This is very generous.
-        if *root_slot > epoch_info.absolute_slot - 256 {
+        } else if *root_slot > epoch_info.absolute_slot - 256 {
             datapoint_info!(
                 "validator-status",
                 ("cluster", config.cluster, String),
@@ -878,7 +996,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         let message = format!(
             "Note: Something is wrong, more than {}% of validators classified \
                        as poor block producers in epoch {}.  Bonus stake frozen",
-            config.max_poor_block_productor_percentage, last_epoch,
+            config.max_poor_block_producer_percentage, last_epoch,
         );
         warn!("{}", message);
         if !config.dry_run {

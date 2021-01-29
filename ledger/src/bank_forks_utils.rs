@@ -33,6 +33,7 @@ pub fn load(
     genesis_config: &GenesisConfig,
     blockstore: &Blockstore,
     account_paths: Vec<PathBuf>,
+    shrink_paths: Option<Vec<PathBuf>>,
     snapshot_config: Option<&SnapshotConfig>,
     process_options: ProcessOptions,
     transaction_status_sender: Option<TransactionStatusSender>,
@@ -66,9 +67,14 @@ pub fn load(
                     compression,
                     genesis_config,
                     process_options.debug_keys.clone(),
-                    Some(&crate::builtins::get(genesis_config.cluster_type)),
+                    Some(&crate::builtins::get(process_options.bpf_jit)),
+                    process_options.account_indexes.clone(),
+                    process_options.accounts_db_caching_enabled,
                 )
                 .expect("Load from snapshot failed");
+                if let Some(shrink_paths) = shrink_paths {
+                    deserialized_bank.set_shrink_paths(shrink_paths);
+                }
 
                 let deserialized_snapshot_hash = (
                     deserialized_bank.slot(),

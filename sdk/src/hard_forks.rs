@@ -1,6 +1,8 @@
 //! The `hard_forks` module is used to maintain the list of slot boundaries for when a hard fork
 //! should occur.
 
+#![cfg(feature = "full")]
+
 use byteorder::{ByteOrder, LittleEndian};
 use solana_sdk::clock::Slot;
 
@@ -20,6 +22,7 @@ impl HardForks {
         } else {
             self.hard_forks.push((new_slot, 1));
         }
+        #[allow(clippy::stable_sort_primitive)]
         self.hard_forks.sort();
     }
 

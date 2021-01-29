@@ -1,8 +1,7 @@
 import React from "react";
-import { StakeAccount as StakeAccountWasm, Meta } from "solana-sdk-wasm";
 import { TableCardBody } from "components/common/TableCardBody";
 import { lamportsToSolString } from "utils";
-import { displayTimestamp } from "utils/date";
+import { displayTimestampUtc } from "utils/date";
 import { Account, useFetchAccountInfo } from "providers/accounts";
 import { Address } from "components/common/Address";
 import {
@@ -22,7 +21,7 @@ export function StakeAccountSection({
   stakeAccountType,
 }: {
   account: Account;
-  stakeAccount: StakeAccountInfo | StakeAccountWasm;
+  stakeAccount: StakeAccountInfo;
   stakeAccountType: StakeAccountType;
   activation?: StakeActivationData;
 }) {
@@ -48,14 +47,10 @@ export function StakeAccountSection({
   );
 }
 
-function LockupCard({
-  stakeAccount,
-}: {
-  stakeAccount: StakeAccountInfo | StakeAccountWasm;
-}) {
-  const unixTimestamp = stakeAccount.meta?.lockup.unixTimestamp;
-  if (unixTimestamp && unixTimestamp > 0) {
-    const prettyTimestamp = displayTimestamp(unixTimestamp * 1000);
+function LockupCard({ stakeAccount }: { stakeAccount: StakeAccountInfo }) {
+  const unixTimestamp = 1000 * (stakeAccount.meta?.lockup.unixTimestamp || 0);
+  if (Date.now() < unixTimestamp) {
+    const prettyTimestamp = displayTimestampUtc(unixTimestamp);
     return (
       <div className="alert alert-warning text-center">
         <strong>Account is locked!</strong> Lockup expires on {prettyTimestamp}
@@ -79,7 +74,7 @@ function OverviewCard({
   stakeAccountType,
 }: {
   account: Account;
-  stakeAccount: StakeAccountInfo | StakeAccountWasm;
+  stakeAccount: StakeAccountInfo;
   stakeAccountType: StakeAccountType;
 }) {
   const refresh = useFetchAccountInfo();
@@ -135,7 +130,7 @@ function DelegationCard({
   stakeAccountType,
   activation,
 }: {
-  stakeAccount: StakeAccountInfo | StakeAccountWasm;
+  stakeAccount: StakeAccountInfo;
   stakeAccountType: StakeAccountType;
   activation?: StakeActivationData;
 }) {
@@ -152,28 +147,15 @@ function DelegationCard({
   };
 
   let voterPubkey, activationEpoch, deactivationEpoch;
-  if ("accountType" in stakeAccount) {
-    const delegation = stakeAccount?.stake?.delegation;
-    if (delegation) {
-      voterPubkey = delegation.voterPubkey;
-      activationEpoch = delegation.isBootstrapStake()
-        ? "-"
-        : delegation.activationEpoch;
-      deactivationEpoch = delegation.isDeactivated()
-        ? delegation.deactivationEpoch
-        : "-";
-    }
-  } else {
-    const delegation = stakeAccount?.stake?.delegation;
-    if (delegation) {
-      voterPubkey = delegation.voter;
-      activationEpoch = delegation.activationEpoch.eq(MAX_EPOCH)
-        ? "-"
-        : delegation.activationEpoch.toString();
-      deactivationEpoch = delegation.deactivationEpoch.eq(MAX_EPOCH)
-        ? "-"
-        : delegation.deactivationEpoch.toString();
-    }
+  const delegation = stakeAccount?.stake?.delegation;
+  if (delegation) {
+    voterPubkey = delegation.voter;
+    activationEpoch = delegation.activationEpoch.eq(MAX_EPOCH)
+      ? "-"
+      : delegation.activationEpoch.toString();
+    deactivationEpoch = delegation.deactivationEpoch.eq(MAX_EPOCH)
+      ? "-"
+      : delegation.deactivationEpoch.toString();
   }
 
   const { stake } = stakeAccount;
@@ -242,7 +224,7 @@ function DelegationCard({
   );
 }
 
-function AuthoritiesCard({ meta }: { meta: Meta | StakeMeta }) {
+function AuthoritiesCard({ meta }: { meta: StakeMeta }) {
   const hasLockup = meta && meta.lockup.unixTimestamp > 0;
   return (
     <div className="card">

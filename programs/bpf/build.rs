@@ -57,16 +57,11 @@ fn main() {
         let install_dir =
             "target/".to_string() + &env::var("PROFILE").unwrap() + &"/bpf".to_string();
 
-        assert!(Command::new("mkdir")
-            .arg("-p")
-            .arg(&install_dir)
-            .status()
-            .expect("Unable to create BPF install directory")
-            .success());
-
         let rust_programs = [
             "128bit",
             "alloc",
+            "call_depth",
+            "caller_access",
             "custom_heap",
             "dep_crate",
             "deprecated_loader",
@@ -75,39 +70,41 @@ fn main() {
             "external_spend",
             "instruction_introspection",
             "invoke",
+            "invoke_and_error",
+            "invoke_and_ok",
+            "invoke_and_return",
             "invoked",
             "iter",
             "many_args",
+            "mem",
             "noop",
             "panic",
             "param_passing",
             "rand",
             "ristretto",
+            "ro_modify",
             "sanity",
             "sha256",
-            "call_depth",
+            "spoof1",
+            "spoof1_system",
             "sysval",
+            "upgradeable",
+            "upgraded",
         ];
         for program in rust_programs.iter() {
             println!(
                 "cargo:warning=(not a warning) Building Rust-based BPF programs: solana_bpf_rust_{}",
                 program
             );
-            assert!(Command::new("bash")
-                .current_dir(format!("rust/{}", program))
-                .args(&["../../../../cargo-build-bpf"])
+            assert!(Command::new("../../cargo-build-bpf")
+                .args(&[
+                    "--manifest-path",
+                    &format!("rust/{}/Cargo.toml", program),
+                    "--bpf-out-dir",
+                    &install_dir
+                ])
                 .status()
                 .expect("Error calling cargo-build-bpf from build.rs")
-                .success());
-            let src = format!(
-                "rust/{0}/solana_bpf_rust_{0}.so",
-                program,
-            );
-            assert!(Command::new("mv")
-                .arg(&src)
-                .arg(&install_dir)
-                .status()
-                .unwrap_or_else(|_| panic!("Failed to cp {} to {}", src, install_dir))
                 .success());
         }
 

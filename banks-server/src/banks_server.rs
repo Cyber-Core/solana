@@ -4,12 +4,10 @@ use futures::{
     future,
     prelude::stream::{self, StreamExt},
 };
-use solana_banks_interface::{Banks, BanksRequest, BanksResponse, TransactionStatus};
-use solana_runtime::{
-    bank::Bank,
-    bank_forks::BankForks,
-    commitment::{BlockCommitmentCache, CommitmentSlots},
+use solana_banks_interface::{
+    Banks, BanksRequest, BanksResponse, TransactionConfirmationStatus, TransactionStatus,
 };
+use solana_runtime::{bank::Bank, bank_forks::BankForks, commitment::BlockCommitmentCache};
 use solana_sdk::{
     account::Account,
     clock::Slot,
@@ -21,7 +19,6 @@ use solana_sdk::{
     transaction::{self, Transaction},
 };
 use std::{
-    collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr},
     sync::{
@@ -38,7 +35,7 @@ use tarpc::{
     server::{self, Channel, Handler},
     transport,
 };
-use tokio::time::delay_for;
+use tokio::time::sleep;
 use tokio_serde::formats::Bincode;
 
 #[derive(Clone)]
@@ -84,11 +81,9 @@ impl BanksServer {
         let (transaction_sender, transaction_receiver) = channel();
         let bank = bank_forks.read().unwrap().working_bank();
         let slot = bank.slot();
-        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::new(
-            HashMap::default(),
-            0,
-            CommitmentSlots::new_from_slot(slot),
-        )));
+        let block_commitment_cache = Arc::new(RwLock::new(
+            BlockCommitmentCache::new_for_tests_with_slots(slot, slot),
+        ));
         Builder::new()
             .name("solana-bank-forks-client".to_string())
             .spawn(move || Self::run(&bank, transaction_receiver))
@@ -109,20 +104,33 @@ impl BanksServer {
 
     async fn poll_signature_status(
         self,
-        signature: Signature,
+        signature: &Signature,
+        blockhash: &Hash,
         last_valid_slot: Slot,
         commitment: CommitmentLevel,
     ) -> Option<transaction::Result<()>> {
-        let mut status = self.bank(commitment).get_signature_status(&signature);
+        let mut status = self
+            .bank(commitment)
+            .get_signature_status_with_blockhash(signature, blockhash);
         while status.is_none() {
-            delay_for(Duration::from_millis(200)).await;
+            sleep(Duration::from_millis(200)).await;
             let bank = self.bank(commitment);
             if bank.slot() > last_valid_slot {
                 break;
             }
-            status = bank.get_signature_status(&signature);
+            status = bank.get_signature_status_with_blockhash(signature, blockhash);
         }
         status
+    }
+}
+
+fn verify_transaction(transaction: &Transaction) -> transaction::Result<()> {
+    if let Err(err) = transaction.verify() {
+        Err(err)
+    } else if let Err(err) = transaction.verify_precompiles() {
+        Err(err)
+    } else {
+        Ok(())
     }
 }
 
@@ -159,11 +167,17 @@ impl Banks for BanksServer {
         _: Context,
         signature: Signature,
     ) -> Option<TransactionStatus> {
-        let bank = self.bank(CommitmentLevel::Recent);
+        let bank = self.bank(CommitmentLevel::Processed);
         let (slot, status) = bank.get_signature_status_slot(&signature)?;
         let r_block_commitment_cache = self.block_commitment_cache.read().unwrap();
 
-        let confirmations = if r_block_commitment_cache.root() >= slot {
+        let optimistically_confirmed_bank = self.bank(CommitmentLevel::Confirmed);
+        let optimistically_confirmed =
+            optimistically_confirmed_bank.get_signature_status_slot(&signature);
+
+        let confirmations = if r_block_commitment_cache.root() >= slot
+            && r_block_commitment_cache.highest_confirmed_root() >= slot
+        {
             None
         } else {
             r_block_commitment_cache
@@ -174,6 +188,13 @@ impl Banks for BanksServer {
             slot,
             confirmations,
             err: status.err(),
+            confirmation_status: if confirmations.is_none() {
+                Some(TransactionConfirmationStatus::Finalized)
+            } else if optimistically_confirmed.is_some() {
+                Some(TransactionConfirmationStatus::Confirmed)
+            } else {
+                Some(TransactionConfirmationStatus::Processed)
+            },
         })
     }
 
@@ -187,19 +208,23 @@ impl Banks for BanksServer {
         transaction: Transaction,
         commitment: CommitmentLevel,
     ) -> Option<transaction::Result<()>> {
+        if let Err(err) = verify_transaction(&transaction) {
+            return Some(Err(err));
+        }
+
         let blockhash = &transaction.message.recent_blockhash;
         let last_valid_slot = self
             .bank_forks
             .read()
             .unwrap()
             .root_bank()
-            .get_blockhash_last_valid_slot(&blockhash)
+            .get_blockhash_last_valid_slot(blockhash)
             .unwrap();
         let signature = transaction.signatures.get(0).cloned().unwrap_or_default();
         let info =
             TransactionInfo::new(signature, serialize(&transaction).unwrap(), last_valid_slot);
         self.transaction_sender.send(info).unwrap();
-        self.poll_signature_status(signature, last_valid_slot, commitment)
+        self.poll_signature_status(&signature, blockhash, last_valid_slot, commitment)
             .await
     }
 

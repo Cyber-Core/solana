@@ -20,6 +20,7 @@ import type {Blockhash} from './blockhash';
 import type {FeeCalculator} from './fee-calculator';
 import type {Account} from './account';
 import type {TransactionSignature} from './transaction';
+import type {CompiledInstruction} from './message';
 import {AgentManager} from './agent-manager';
 
 export const BLOCKHASH_CACHE_TIMEOUT_MS = 30 * 1000;
@@ -275,6 +276,7 @@ const GetInflationGovernorResult = struct({
  * @property {number} slotsInEpoch
  * @property {number} absoluteSlot
  * @property {number} blockHeight
+ * @property {number} transactionCount
  */
 type EpochInfo = {
   epoch: number,
@@ -282,6 +284,7 @@ type EpochInfo = {
   slotsInEpoch: number,
   absoluteSlot: number,
   blockHeight: number | null,
+  transactionCount: number | null,
 };
 
 const GetEpochInfoResult = struct({
@@ -290,6 +293,7 @@ const GetEpochInfoResult = struct({
   slotsInEpoch: 'number',
   absoluteSlot: 'number',
   blockHeight: 'number?',
+  transactionCount: 'number?',
 });
 
 /**
@@ -367,21 +371,67 @@ const SimulatedTransactionResponseValidator = jsonRpcResultAndContext(
   }),
 );
 
+type ParsedInnerInstruction = {
+  index: number,
+  instructions: (ParsedInstruction | PartiallyDecodedInstruction)[],
+};
+
+type TokenBalance = {
+  accountIndex: number,
+  mint: string,
+  uiTokenAmount: TokenAmount,
+};
+
+/**
+ * Metadata for a parsed confirmed transaction on the ledger
+ *
+ * @typedef {Object} ParsedConfirmedTransactionMeta
+ * @property {number} fee The fee charged for processing the transaction
+ * @property {Array<ParsedInnerInstruction>} innerInstructions An array of cross program invoked parsed instructions
+ * @property {Array<number>} preBalances The balances of the transaction accounts before processing
+ * @property {Array<number>} postBalances The balances of the transaction accounts after processing
+ * @property {Array<string>} logMessages An array of program log messages emitted during a transaction
+ * @property {Array<TokenBalance>} preTokenBalances The token balances of the transaction accounts before processing
+ * @property {Array<TokenBalance>} postTokenBalances The token balances of the transaction accounts after processing
+ * @property {object|null} err The error result of transaction processing
+ */
+type ParsedConfirmedTransactionMeta = {
+  fee: number,
+  innerInstructions?: ParsedInnerInstruction[],
+  preBalances: Array<number>,
+  postBalances: Array<number>,
+  logMessages?: Array<string>,
+  preTokenBalances?: Array<TokenBalance>,
+  postTokenBalances?: Array<TokenBalance>,
+  err: TransactionError | null,
+};
+
+type CompiledInnerInstruction = {
+  index: number,
+  instructions: CompiledInstruction[],
+};
+
 /**
  * Metadata for a confirmed transaction on the ledger
  *
  * @typedef {Object} ConfirmedTransactionMeta
  * @property {number} fee The fee charged for processing the transaction
+ * @property {Array<CompiledInnerInstruction>} innerInstructions An array of cross program invoked instructions
  * @property {Array<number>} preBalances The balances of the transaction accounts before processing
  * @property {Array<number>} postBalances The balances of the transaction accounts after processing
  * @property {Array<string>} logMessages An array of program log messages emitted during a transaction
+ * @property {Array<TokenBalance>} preTokenBalances The token balances of the transaction accounts before processing
+ * @property {Array<TokenBalance>} postTokenBalances The token balances of the transaction accounts after processing
  * @property {object|null} err The error result of transaction processing
  */
 type ConfirmedTransactionMeta = {
   fee: number,
+  innerInstructions?: CompiledInnerInstruction[],
   preBalances: Array<number>,
   postBalances: Array<number>,
   logMessages?: Array<string>,
+  preTokenBalances?: Array<TokenBalance>,
+  postTokenBalances?: Array<TokenBalance>,
   err: TransactionError | null,
 };
 
@@ -392,11 +442,13 @@ type ConfirmedTransactionMeta = {
  * @property {number} slot The slot during which the transaction was processed
  * @property {Transaction} transaction The details of the transaction
  * @property {ConfirmedTransactionMeta|null} meta Metadata produced from the transaction
+ * @property {number|null|undefined} blockTime The unix timestamp of when the transaction was processed
  */
 type ConfirmedTransaction = {
   slot: number,
   transaction: Transaction,
   meta: ConfirmedTransactionMeta | null,
+  blockTime?: number | null,
 };
 
 /**
@@ -474,11 +526,13 @@ type ParsedTransaction = {
  * @property {number} slot The slot during which the transaction was processed
  * @property {ParsedTransaction} transaction The details of the transaction
  * @property {ConfirmedTransactionMeta|null} meta Metadata produced from the transaction
+ * @property {number|null|undefined} blockTime The unix timestamp of when the transaction was processed
  */
 type ParsedConfirmedTransaction = {
   slot: number,
   transaction: ParsedTransaction,
-  meta: ConfirmedTransactionMeta | null,
+  meta: ParsedConfirmedTransactionMeta | null,
+  blockTime?: number | null,
 };
 
 /**
@@ -884,11 +938,12 @@ const GetConfirmedSignaturesForAddressRpcResult = jsonRpcResult(
 
 const GetConfirmedSignaturesForAddress2RpcResult = jsonRpcResult(
   struct.array([
-    struct({
+    struct.pick({
       signature: 'string',
       slot: 'number',
       err: TransactionErrorResult,
       memo: struct.union(['null', 'string']),
+      blockTime: struct.union(['undefined', 'null', 'number']),
     }),
   ]),
 );
@@ -1044,6 +1099,7 @@ const GetSignatureStatusesRpcResult = jsonRpcResultAndContext(
         slot: 'number',
         confirmations: struct.union(['number', 'null']),
         err: TransactionErrorResult,
+        confirmationStatus: 'string?',
       }),
     ]),
   ]),
@@ -1126,9 +1182,121 @@ const ConfirmedTransactionMetaResult = struct.union([
   struct.pick({
     err: TransactionErrorResult,
     fee: 'number',
+    innerInstructions: struct.union([
+      struct.array([
+        struct({
+          index: 'number',
+          instructions: struct.array([
+            struct({
+              accounts: struct.array(['number']),
+              data: 'string',
+              programIdIndex: 'number',
+            }),
+          ]),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
     preBalances: struct.array(['number']),
     postBalances: struct.array(['number']),
     logMessages: struct.union([struct.array(['string']), 'null', 'undefined']),
+    preTokenBalances: struct.union([
+      struct.array([
+        struct.pick({
+          accountIndex: 'number',
+          mint: 'string',
+          uiTokenAmount: struct.pick({
+            amount: 'string',
+            decimals: 'number',
+            uiAmount: 'number',
+          }),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
+    postTokenBalances: struct.union([
+      struct.array([
+        struct.pick({
+          accountIndex: 'number',
+          mint: 'string',
+          uiTokenAmount: struct.pick({
+            amount: 'string',
+            decimals: 'number',
+            uiAmount: 'number',
+          }),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
+  }),
+]);
+/**
+ * @private
+ */
+const ParsedConfirmedTransactionMetaResult = struct.union([
+  'null',
+  struct.pick({
+    err: TransactionErrorResult,
+    fee: 'number',
+    innerInstructions: struct.union([
+      struct.array([
+        struct({
+          index: 'number',
+          instructions: struct.array([
+            struct.union([
+              struct({
+                accounts: struct.array(['string']),
+                data: 'string',
+                programId: 'string',
+              }),
+              struct({
+                parsed: 'any',
+                program: 'string',
+                programId: 'string',
+              }),
+            ]),
+          ]),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
+    preBalances: struct.array(['number']),
+    postBalances: struct.array(['number']),
+    logMessages: struct.union([struct.array(['string']), 'null', 'undefined']),
+    preTokenBalances: struct.union([
+      struct.array([
+        struct.pick({
+          accountIndex: 'number',
+          mint: 'string',
+          uiTokenAmount: struct.pick({
+            amount: 'string',
+            decimals: 'number',
+            uiAmount: 'number',
+          }),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
+    postTokenBalances: struct.union([
+      struct.array([
+        struct.pick({
+          accountIndex: 'number',
+          mint: 'string',
+          uiTokenAmount: struct.pick({
+            amount: 'string',
+            decimals: 'number',
+            uiAmount: 'number',
+          }),
+        }),
+      ]),
+      'null',
+      'undefined',
+    ]),
   }),
 ]);
 
@@ -1173,6 +1341,7 @@ const GetConfirmedTransactionRpcResult = jsonRpcResult(
       slot: 'number',
       transaction: ConfirmedTransactionResult,
       meta: ConfirmedTransactionMetaResult,
+      blockTime: struct.union(['number', 'null', 'undefined']),
     }),
   ]),
 );
@@ -1186,7 +1355,8 @@ const GetParsedConfirmedTransactionRpcResult = jsonRpcResult(
     struct.pick({
       slot: 'number',
       transaction: ParsedConfirmedTransactionResult,
-      meta: ConfirmedTransactionMetaResult,
+      meta: ParsedConfirmedTransactionMetaResult,
+      blockTime: struct.union(['number', 'null', 'undefined']),
     }),
   ]),
 );
@@ -1419,11 +1589,13 @@ export type TransactionError = {};
  * @property {number} slot when the transaction was processed
  * @property {number | null} confirmations the number of blocks that have been confirmed and voted on in the fork containing `slot` (TODO)
  * @property {TransactionError | null} err error, if any
+ * @property {string | null} confirmationStatus the transaction's cluster confirmation status, if data available. Possible non-null responses: `processed`, `confirmed`, `finalized`
  */
 export type SignatureStatus = {
   slot: number,
   confirmations: number | null,
   err: TransactionError | null,
+  confirmationStatus: string | null,
 };
 
 /**
@@ -1434,12 +1606,14 @@ export type SignatureStatus = {
  * @property {number} slot when the transaction was processed
  * @property {TransactionError | null} err error, if any
  * @property {string | null} memo memo associated with the transaction, if any
+ * @property {number | null | undefined} blockTime The unix timestamp of when the transaction was processed
  */
 export type ConfirmedSignatureInfo = {
   signature: string,
   slot: number,
   err: TransactionError | null,
   memo: string | null,
+  blockTime?: number | null,
 };
 
 /**
@@ -2073,8 +2247,6 @@ export class Connection {
 
   /**
    * Confirm the transaction identified by the specified signature.
-   *
-   * If `commitment` is not specified, default to 'max'.
    */
   async confirmTransaction(
     signature: TransactionSignature,
@@ -2090,7 +2262,7 @@ export class Connection {
     assert(decodedSignature.length === 64, 'signature has invalid length');
 
     const start = Date.now();
-    const subscriptionCommitment: Commitment = commitment || 'max';
+    const subscriptionCommitment = commitment || this.commitment;
 
     let subscriptionId;
     let response: RpcResponseAndContext<SignatureResult> | null = null;
@@ -2118,7 +2290,7 @@ export class Connection {
       case 'recent':
       case 'single':
       case 'singleGossip': {
-        timeoutMs = 10 * 1000;
+        timeoutMs = 30 * 1000;
         break;
       }
       // exhaust enums to ensure full coverage
@@ -2137,7 +2309,9 @@ export class Connection {
     if (response === null) {
       const duration = (Date.now() - start) / 1000;
       throw new Error(
-        `Transaction was not confirmed in ${duration.toFixed(2)} seconds`,
+        `Transaction was not confirmed in ${duration.toFixed(
+          2,
+        )} seconds. It is unknown if it succeeded or failed. Check signature ${signature} using the Solana Explorer or CLI tools.`,
       );
     }
 
@@ -2445,10 +2619,11 @@ export class Connection {
    */
   async getConfirmedBlock(slot: number): Promise<ConfirmedBlock> {
     const unsafeRes = await this._rpcRequest('getConfirmedBlock', [slot]);
-    const {result, error} = GetConfirmedBlockRpcResult(unsafeRes);
-    if (error) {
-      throw new Error('failed to get confirmed block: ' + result.error.message);
+    const res = GetConfirmedBlockRpcResult(unsafeRes);
+    if (res.error) {
+      throw new Error('failed to get confirmed block: ' + res.error.message);
     }
+    const result = res.result;
     assert(typeof result !== 'undefined');
     if (!result) {
       throw new Error('Confirmed block ' + slot + ' not found');
@@ -2510,6 +2685,18 @@ export class Connection {
     }
     assert(typeof result !== 'undefined');
     if (result === null) return result;
+
+    if (result.meta.innerInstructions) {
+      result.meta.innerInstructions.forEach(inner => {
+        inner.instructions.forEach(ix => {
+          ix.programId = new PublicKey(ix.programId);
+
+          if (ix.accounts) {
+            ix.accounts = ix.accounts.map(account => new PublicKey(account));
+          }
+        });
+      });
+    }
 
     const {
       accountKeys,
@@ -2748,7 +2935,10 @@ export class Connection {
     const signData = transaction.serializeMessage();
     const wireTransaction = transaction._serialize(signData);
     const encodedTransaction = wireTransaction.toString('base64');
-    const config: any = {encoding: 'base64'};
+    const config: any = {
+      encoding: 'base64',
+      commitment: this.commitment,
+    };
     const args = [encodedTransaction, config];
 
     if (signers) {
@@ -2842,21 +3032,24 @@ export class Connection {
     const skipPreflight = options && options.skipPreflight;
     const preflightCommitment = options && options.preflightCommitment;
 
-    if (skipPreflight && preflightCommitment) {
-      throw new Error(
-        'cannot set preflightCommitment when skipPreflight is enabled',
-      );
-    }
-
     if (skipPreflight) {
       config.skipPreflight = skipPreflight;
-    } else if (preflightCommitment) {
+    }
+    if (preflightCommitment) {
       config.preflightCommitment = preflightCommitment;
     }
 
     const unsafeRes = await this._rpcRequest('sendTransaction', args);
     const res = SendTransactionRpcResult(unsafeRes);
     if (res.error) {
+      if (res.error.data) {
+        const logs = res.error.data.logs;
+        if (logs && Array.isArray(logs)) {
+          const traceIndent = '\n    ';
+          const logTrace = traceIndent + logs.join(traceIndent);
+          console.error(res.error.message, logTrace);
+        }
+      }
       throw new Error('failed to send transaction: ' + res.error.message);
     }
     assert(typeof res.result !== 'undefined');

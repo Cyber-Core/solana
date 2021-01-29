@@ -16,7 +16,7 @@ import {BPF_LOADER_PROGRAM_ID} from '../src/bpf-loader';
 
 if (!mockRpcEnabled) {
   // The default of 5 seconds is too slow for live testing sometimes
-  jest.setTimeout(120000);
+  jest.setTimeout(240000);
 }
 
 test('load BPF C program', async () => {
@@ -54,7 +54,7 @@ test('load BPF C program', async () => {
   });
   await sendAndConfirmTransaction(connection, transaction, [from], {
     commitment: 'singleGossip',
-    skipPreflight: true,
+    preflightCommitment: 'singleGossip',
   });
 });
 
@@ -67,7 +67,6 @@ describe('load BPF Rust program', () => {
   const connection = new Connection(url, 'singleGossip');
 
   let program: Account;
-  let signature: string;
   let payerAccount: Account;
   let programData: Buffer;
 
@@ -106,7 +105,7 @@ describe('load BPF Rust program', () => {
       programData,
       BPF_LOADER_PROGRAM_ID,
     );
-    await expect(failedLoad).rejects.toThrow('Transaction was not confirmed');
+    await expect(failedLoad).rejects.toThrow();
 
     // Second load will succeed
     await BpfLoader.load(
@@ -116,7 +115,9 @@ describe('load BPF Rust program', () => {
       programData,
       BPF_LOADER_PROGRAM_ID,
     );
+  });
 
+  test('get confirmed transaction', async () => {
     const transaction = new Transaction().add({
       keys: [
         {pubkey: payerAccount.publicKey, isSigner: true, isWritable: true},
@@ -124,17 +125,16 @@ describe('load BPF Rust program', () => {
       programId: program.publicKey,
     });
 
-    signature = await sendAndConfirmTransaction(
+    const signature = await sendAndConfirmTransaction(
       connection,
       transaction,
       [payerAccount],
       {
-        skipPreflight: true,
+        commitment: 'max', // `getParsedConfirmedTransaction` requires max commitment
+        preflightCommitment: connection.commitment || 'max',
       },
     );
-  });
 
-  test('get confirmed transaction', async () => {
     const parsedTx = await connection.getParsedConfirmedTransaction(signature);
     if (parsedTx === null) {
       expect(parsedTx).not.toBeNull();
@@ -170,13 +170,15 @@ describe('load BPF Rust program', () => {
     }
 
     expect(logs.length).toBeGreaterThanOrEqual(2);
-    expect(logs[0]).toEqual(`Call BPF program ${program.publicKey.toBase58()}`);
+    expect(logs[0]).toEqual(
+      `Program ${program.publicKey.toBase58()} invoke [1]`,
+    );
     expect(logs[logs.length - 1]).toEqual(
-      `BPF program ${program.publicKey.toBase58()} success`,
+      `Program ${program.publicKey.toBase58()} success`,
     );
   });
 
-  test('simulate transaction without signature verification', async () => {
+  test('deprecated - simulate transaction without signature verification', async () => {
     const simulatedTransaction = new Transaction().add({
       keys: [
         {pubkey: payerAccount.publicKey, isSigner: true, isWritable: true},
@@ -196,9 +198,40 @@ describe('load BPF Rust program', () => {
     }
 
     expect(logs.length).toBeGreaterThanOrEqual(2);
-    expect(logs[0]).toEqual(`Call BPF program ${program.publicKey.toBase58()}`);
+    expect(logs[0]).toEqual(
+      `Program ${program.publicKey.toBase58()} invoke [1]`,
+    );
     expect(logs[logs.length - 1]).toEqual(
-      `BPF program ${program.publicKey.toBase58()} success`,
+      `Program ${program.publicKey.toBase58()} success`,
+    );
+  });
+
+  test('simulate transaction without signature verification', async () => {
+    const simulatedTransaction = new Transaction({
+      feePayer: payerAccount.publicKey,
+    }).add({
+      keys: [
+        {pubkey: payerAccount.publicKey, isSigner: true, isWritable: true},
+      ],
+      programId: program.publicKey,
+    });
+
+    const {err, logs} = (
+      await connection.simulateTransaction(simulatedTransaction)
+    ).value;
+    expect(err).toBeNull();
+
+    if (logs === null) {
+      expect(logs).not.toBeNull();
+      return;
+    }
+
+    expect(logs.length).toBeGreaterThanOrEqual(2);
+    expect(logs[0]).toEqual(
+      `Program ${program.publicKey.toBase58()} invoke [1]`,
+    );
+    expect(logs[logs.length - 1]).toEqual(
+      `Program ${program.publicKey.toBase58()} success`,
     );
   });
 

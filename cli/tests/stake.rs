@@ -9,7 +9,7 @@ use solana_client::{
     nonce_utils,
     rpc_client::RpcClient,
 };
-use solana_core::test_validator::{TestValidator, TestValidatorOptions};
+use solana_core::test_validator::TestValidator;
 use solana_faucet::faucet::run_local_faucet;
 use solana_sdk::{
     account_utils::StateMut,
@@ -22,26 +22,19 @@ use solana_stake_program::{
     stake_instruction::LockupArgs,
     stake_state::{Lockup, StakeAuthorize, StakeState},
 };
-use std::{fs::remove_dir_all, sync::mpsc::channel};
 
 #[test]
 fn test_stake_delegation_force() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let default_signer = Keypair::new();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     request_and_confirm_airdrop(
@@ -113,33 +106,22 @@ fn test_stake_delegation_force() {
         fee_payer: 0,
     };
     process_command(&config).unwrap();
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_seed_stake_delegation_and_deactivation() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        vote_pubkey,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
 
     let validator_keypair = keypair_from_seed(&[0u8; 32]).unwrap();
     let mut config_validator = CliConfig::recent_for_tests();
-    config_validator.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config_validator.json_rpc_url = test_validator.rpc_url();
     config_validator.signers = vec![&validator_keypair];
 
     request_and_confirm_airdrop(
@@ -180,7 +162,7 @@ fn test_seed_stake_delegation_and_deactivation() {
     // Delegate stake
     config_validator.command = CliCommand::DelegateStake {
         stake_account_pubkey: stake_address,
-        vote_account_pubkey: vote_pubkey,
+        vote_account_pubkey: test_validator.vote_account_address(),
         stake_authority: 0,
         force: true,
         sign_only: false,
@@ -202,33 +184,22 @@ fn test_seed_stake_delegation_and_deactivation() {
         fee_payer: 0,
     };
     process_command(&config_validator).unwrap();
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_stake_delegation_and_deactivation() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        vote_pubkey,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let validator_keypair = Keypair::new();
 
     let mut config_validator = CliConfig::recent_for_tests();
-    config_validator.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config_validator.json_rpc_url = test_validator.rpc_url();
     config_validator.signers = vec![&validator_keypair];
 
     let stake_keypair = keypair_from_seed(&[0u8; 32]).unwrap();
@@ -265,7 +236,7 @@ fn test_stake_delegation_and_deactivation() {
     config_validator.signers.pop();
     config_validator.command = CliCommand::DelegateStake {
         stake_account_pubkey: stake_keypair.pubkey(),
-        vote_account_pubkey: vote_pubkey,
+        vote_account_pubkey: test_validator.vote_account_address(),
         stake_authority: 0,
         force: true,
         sign_only: false,
@@ -287,38 +258,26 @@ fn test_stake_delegation_and_deactivation() {
         fee_payer: 0,
     };
     process_command(&config_validator).unwrap();
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_offline_stake_delegation_and_deactivation() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        vote_pubkey,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
 
     let mut config_validator = CliConfig::recent_for_tests();
-    config_validator.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config_validator.json_rpc_url = test_validator.rpc_url();
     let validator_keypair = Keypair::new();
     config_validator.signers = vec![&validator_keypair];
 
     let mut config_payer = CliConfig::recent_for_tests();
-    config_payer.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config_payer.json_rpc_url = test_validator.rpc_url();
 
     let stake_keypair = keypair_from_seed(&[0u8; 32]).unwrap();
 
@@ -372,7 +331,7 @@ fn test_offline_stake_delegation_and_deactivation() {
     let (blockhash, _) = rpc_client.get_recent_blockhash().unwrap();
     config_offline.command = CliCommand::DelegateStake {
         stake_account_pubkey: stake_keypair.pubkey(),
-        vote_account_pubkey: vote_pubkey,
+        vote_account_pubkey: test_validator.vote_account_address(),
         stake_authority: 0,
         force: true,
         sign_only: true,
@@ -391,7 +350,7 @@ fn test_offline_stake_delegation_and_deactivation() {
     config_payer.signers = vec![&offline_presigner];
     config_payer.command = CliCommand::DelegateStake {
         stake_account_pubkey: stake_keypair.pubkey(),
-        vote_account_pubkey: vote_pubkey,
+        vote_account_pubkey: test_validator.vote_account_address(),
         stake_authority: 0,
         force: true,
         sign_only: false,
@@ -430,33 +389,23 @@ fn test_offline_stake_delegation_and_deactivation() {
         fee_payer: 0,
     };
     process_command(&config_payer).unwrap();
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_nonced_stake_delegation_and_deactivation() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        vote_pubkey,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
 
     let config_keypair = keypair_from_seed(&[0u8; 32]).unwrap();
     let mut config = CliConfig::recent_for_tests();
     config.signers = vec![&config_keypair];
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
 
     let minimum_nonce_balance = rpc_client
         .get_minimum_balance_for_rent_exemption(NonceState::size())
@@ -505,7 +454,7 @@ fn test_nonced_stake_delegation_and_deactivation() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -515,7 +464,7 @@ fn test_nonced_stake_delegation_and_deactivation() {
     config.signers = vec![&config_keypair];
     config.command = CliCommand::DelegateStake {
         stake_account_pubkey: stake_keypair.pubkey(),
-        vote_account_pubkey: vote_pubkey,
+        vote_account_pubkey: test_validator.vote_account_address(),
         stake_authority: 0,
         force: true,
         sign_only: false,
@@ -533,7 +482,7 @@ fn test_nonced_stake_delegation_and_deactivation() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -553,31 +502,22 @@ fn test_nonced_stake_delegation_and_deactivation() {
         fee_payer: 0,
     };
     process_command(&config).unwrap();
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_stake_authorize() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let default_signer = Keypair::new();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     request_and_confirm_airdrop(
@@ -639,13 +579,10 @@ fn test_stake_authorize() {
         nonce_account: None,
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     process_command(&config).unwrap();
-    let stake_account = rpc_client
-        .get_account_with_commitment(&stake_account_pubkey, CommitmentConfig::recent())
-        .unwrap()
-        .value
-        .unwrap();
+    let stake_account = rpc_client.get_account(&stake_account_pubkey).unwrap();
     let stake_state: StakeState = stake_account.state().unwrap();
     let current_authority = match stake_state {
         StakeState::Initialized(meta) => meta.authorized.staker,
@@ -670,13 +607,10 @@ fn test_stake_authorize() {
         nonce_account: None,
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     process_command(&config).unwrap();
-    let stake_account = rpc_client
-        .get_account_with_commitment(&stake_account_pubkey, CommitmentConfig::recent())
-        .unwrap()
-        .value
-        .unwrap();
+    let stake_account = rpc_client.get_account(&stake_account_pubkey).unwrap();
     let stake_state: StakeState = stake_account.state().unwrap();
     let (current_staker, current_withdrawer) = match stake_state {
         StakeState::Initialized(meta) => (meta.authorized.staker, meta.authorized.withdrawer),
@@ -696,13 +630,10 @@ fn test_stake_authorize() {
         nonce_account: None,
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     process_command(&config).unwrap();
-    let stake_account = rpc_client
-        .get_account_with_commitment(&stake_account_pubkey, CommitmentConfig::recent())
-        .unwrap()
-        .value
-        .unwrap();
+    let stake_account = rpc_client.get_account(&stake_account_pubkey).unwrap();
     let stake_state: StakeState = stake_account.state().unwrap();
     let current_authority = match stake_state {
         StakeState::Initialized(meta) => meta.authorized.staker,
@@ -713,10 +644,7 @@ fn test_stake_authorize() {
     // Offline assignment of new nonced stake authority
     let nonced_authority = Keypair::new();
     let nonced_authority_pubkey = nonced_authority.pubkey();
-    let (blockhash, _, _) = rpc_client
-        .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
-        .unwrap()
-        .value;
+    let (blockhash, _) = rpc_client.get_recent_blockhash().unwrap();
     config_offline.command = CliCommand::StakeAuthorize {
         stake_account_pubkey,
         new_authorizations: vec![(StakeAuthorize::Staker, nonced_authority_pubkey, 0)],
@@ -725,6 +653,7 @@ fn test_stake_authorize() {
         nonce_account: None,
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     config_offline.output_format = OutputFormat::JsonCompact;
     let sign_reply = process_command(&config_offline).unwrap();
@@ -740,13 +669,10 @@ fn test_stake_authorize() {
         nonce_account: None,
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     process_command(&config).unwrap();
-    let stake_account = rpc_client
-        .get_account_with_commitment(&stake_account_pubkey, CommitmentConfig::recent())
-        .unwrap()
-        .value
-        .unwrap();
+    let stake_account = rpc_client.get_account(&stake_account_pubkey).unwrap();
     let stake_state: StakeState = stake_account.state().unwrap();
     let current_authority = match stake_state {
         StakeState::Initialized(meta) => meta.authorized.staker,
@@ -772,7 +698,7 @@ fn test_stake_authorize() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -790,6 +716,7 @@ fn test_stake_authorize() {
         nonce_account: Some(nonce_account.pubkey()),
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     let sign_reply = process_command(&config_offline).unwrap();
     let sign_only = parse_sign_only_reply_string(&sign_reply);
@@ -809,13 +736,10 @@ fn test_stake_authorize() {
         nonce_account: Some(nonce_account.pubkey()),
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     process_command(&config).unwrap();
-    let stake_account = rpc_client
-        .get_account_with_commitment(&stake_account_pubkey, CommitmentConfig::recent())
-        .unwrap()
-        .value
-        .unwrap();
+    let stake_account = rpc_client.get_account(&stake_account_pubkey).unwrap();
     let stake_state: StakeState = stake_account.state().unwrap();
     let current_authority = match stake_state {
         StakeState::Initialized(meta) => meta.authorized.staker,
@@ -826,15 +750,12 @@ fn test_stake_authorize() {
     let new_nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
     .blockhash;
     assert_ne!(nonce_hash, new_nonce_hash);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
@@ -842,34 +763,23 @@ fn test_stake_authorize_with_fee_payer() {
     solana_logger::setup();
     const SIG_FEE: u64 = 42;
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run_with_options(TestValidatorOptions {
-        fees: SIG_FEE,
-        bootstrap_validator_lamports: 42_000,
-        ..TestValidatorOptions::default()
-    });
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_custom_fees(mint_keypair.pubkey(), SIG_FEE);
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let default_signer = Keypair::new();
     let default_pubkey = default_signer.pubkey();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     let payer_keypair = keypair_from_seed(&[0u8; 32]).unwrap();
     let mut config_payer = CliConfig::recent_for_tests();
     config_payer.signers = vec![&payer_keypair];
-    config_payer.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config_payer.json_rpc_url = test_validator.rpc_url();
     let payer_pubkey = config_payer.signers[0].pubkey();
 
     let mut config_offline = CliConfig::recent_for_tests();
@@ -927,6 +837,7 @@ fn test_stake_authorize_with_fee_payer() {
         nonce_account: None,
         nonce_authority: 0,
         fee_payer: 1,
+        custodian: None,
     };
     process_command(&config).unwrap();
     // `config` balance has not changed, despite submitting the TX
@@ -936,10 +847,7 @@ fn test_stake_authorize_with_fee_payer() {
     check_recent_balance(100_000 - SIG_FEE - SIG_FEE, &rpc_client, &payer_pubkey);
 
     // Assign authority with offline fee payer
-    let (blockhash, _, _) = rpc_client
-        .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
-        .unwrap()
-        .value;
+    let (blockhash, _) = rpc_client.get_recent_blockhash().unwrap();
     config_offline.command = CliCommand::StakeAuthorize {
         stake_account_pubkey,
         new_authorizations: vec![(StakeAuthorize::Staker, payer_pubkey, 0)],
@@ -948,6 +856,7 @@ fn test_stake_authorize_with_fee_payer() {
         nonce_account: None,
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     config_offline.output_format = OutputFormat::JsonCompact;
     let sign_reply = process_command(&config_offline).unwrap();
@@ -963,6 +872,7 @@ fn test_stake_authorize_with_fee_payer() {
         nonce_account: None,
         nonce_authority: 0,
         fee_payer: 0,
+        custodian: None,
     };
     process_command(&config).unwrap();
     // `config`'s balance again has not changed
@@ -970,36 +880,23 @@ fn test_stake_authorize_with_fee_payer() {
     // `config_offline` however has paid 1 sig due to being both authority
     // and fee payer
     check_recent_balance(100_000 - SIG_FEE, &rpc_client, &offline_pubkey);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_stake_split() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run_with_options(TestValidatorOptions {
-        fees: 1,
-        bootstrap_validator_lamports: 42_000,
-        ..TestValidatorOptions::default()
-    });
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_custom_fees(mint_keypair.pubkey(), 1);
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let default_signer = Keypair::new();
     let offline_signer = Keypair::new();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     let mut config_offline = CliConfig::recent_for_tests();
@@ -1071,7 +968,7 @@ fn test_stake_split() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -1125,36 +1022,23 @@ fn test_stake_split() {
         &rpc_client,
         &split_account.pubkey(),
     );
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_stake_set_lockup() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run_with_options(TestValidatorOptions {
-        fees: 1,
-        bootstrap_validator_lamports: 42_000,
-        ..TestValidatorOptions::default()
-    });
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_custom_fees(mint_keypair.pubkey(), 1);
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let default_signer = Keypair::new();
     let offline_signer = Keypair::new();
 
     let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     let mut config_offline = CliConfig::recent_for_tests();
@@ -1187,8 +1071,10 @@ fn test_stake_set_lockup() {
     let stake_keypair = keypair_from_seed(&[0u8; 32]).unwrap();
     let stake_account_pubkey = stake_keypair.pubkey();
 
-    let mut lockup = Lockup::default();
-    lockup.custodian = config.signers[0].pubkey();
+    let lockup = Lockup {
+        custodian: config.signers[0].pubkey(),
+        ..Lockup::default()
+    };
 
     config.signers.push(&stake_keypair);
     config.command = CliCommand::CreateStakeAccount {
@@ -1230,11 +1116,7 @@ fn test_stake_set_lockup() {
         fee_payer: 0,
     };
     process_command(&config).unwrap();
-    let stake_account = rpc_client
-        .get_account_with_commitment(&stake_account_pubkey, CommitmentConfig::recent())
-        .unwrap()
-        .value
-        .unwrap();
+    let stake_account = rpc_client.get_account(&stake_account_pubkey).unwrap();
     let stake_state: StakeState = stake_account.state().unwrap();
     let current_lockup = match stake_state {
         StakeState::Initialized(meta) => meta.lockup,
@@ -1285,11 +1167,7 @@ fn test_stake_set_lockup() {
         fee_payer: 0,
     };
     process_command(&config).unwrap();
-    let stake_account = rpc_client
-        .get_account_with_commitment(&stake_account_pubkey, CommitmentConfig::recent())
-        .unwrap()
-        .value
-        .unwrap();
+    let stake_account = rpc_client.get_account(&stake_account_pubkey).unwrap();
     let stake_state: StakeState = stake_account.state().unwrap();
     let current_lockup = match stake_state {
         StakeState::Initialized(meta) => meta.lockup,
@@ -1340,7 +1218,7 @@ fn test_stake_set_lockup() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -1382,11 +1260,7 @@ fn test_stake_set_lockup() {
         fee_payer: 0,
     };
     process_command(&config).unwrap();
-    let stake_account = rpc_client
-        .get_account_with_commitment(&stake_account_pubkey, CommitmentConfig::recent())
-        .unwrap()
-        .value
-        .unwrap();
+    let stake_account = rpc_client.get_account(&stake_account_pubkey).unwrap();
     let stake_state: StakeState = stake_account.state().unwrap();
     let current_lockup = match stake_state {
         StakeState::Initialized(meta) => meta.lockup,
@@ -1398,32 +1272,22 @@ fn test_stake_set_lockup() {
     );
     assert_eq!(current_lockup.epoch, lockup.epoch.unwrap());
     assert_eq!(current_lockup.custodian, offline_pubkey);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }
 
 #[test]
 fn test_offline_nonced_create_stake_account_and_withdraw() {
     solana_logger::setup();
 
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_no_fees(mint_keypair.pubkey());
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
-
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let mut config = CliConfig::recent_for_tests();
     let default_signer = keypair_from_seed(&[1u8; 32]).unwrap();
     config.signers = vec![&default_signer];
-    config.json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    config.json_rpc_url = test_validator.rpc_url();
 
     let mut config_offline = CliConfig::recent_for_tests();
     let offline_signer = keypair_from_seed(&[2u8; 32]).unwrap();
@@ -1467,7 +1331,7 @@ fn test_offline_nonced_create_stake_account_and_withdraw() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -1522,7 +1386,7 @@ fn test_offline_nonced_create_stake_account_and_withdraw() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -1570,7 +1434,7 @@ fn test_offline_nonced_create_stake_account_and_withdraw() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -1619,7 +1483,4 @@ fn test_offline_nonced_create_stake_account_and_withdraw() {
     let seed_address =
         Pubkey::create_with_seed(&stake_pubkey, seed, &solana_stake_program::id()).unwrap();
     check_recent_balance(50_000, &rpc_client, &seed_address);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }

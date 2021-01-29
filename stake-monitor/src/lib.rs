@@ -357,7 +357,7 @@ pub fn process_slots(rpc_client: &RpcClient, accounts_info: &mut AccountsInfo, b
 #[cfg(test)]
 mod test {
     use super::*;
-    use serial_test_derive::serial;
+    use serial_test::serial;
     use solana_client::rpc_config::RpcSendTransactionConfig;
     use solana_core::{rpc::JsonRpcConfig, validator::ValidatorConfig};
     use solana_local_cluster::local_cluster::{ClusterConfig, LocalCluster};
@@ -379,7 +379,7 @@ mod test {
         let mut accounts_info = AccountsInfo::default();
 
         let one_sol = sol_to_lamports(1.0);
-        let cluster = LocalCluster::new(&ClusterConfig {
+        let cluster = LocalCluster::new(&mut ClusterConfig {
             cluster_type: ClusterType::MainnetBeta,
             node_stakes: vec![10; 1],
             cluster_lamports: sol_to_lamports(1_000_000_000.0),
@@ -418,7 +418,7 @@ mod test {
             .unwrap();
 
         rpc_client
-            .poll_for_signature_with_commitment(&stake1_signature, CommitmentConfig::recent())
+            .poll_for_signature_with_commitment(&stake1_signature, CommitmentConfig::processed())
             .unwrap();
 
         // A balance increase by system transfer is ignored
@@ -473,7 +473,7 @@ mod test {
         rpc_client
             .poll_for_signature_with_commitment(
                 &stake3_initialize_signature,
-                CommitmentConfig::recent(),
+                CommitmentConfig::processed(),
             )
             .unwrap();
 
@@ -504,7 +504,7 @@ mod test {
         rpc_client
             .poll_for_signature_with_commitment(
                 &stake3_withdraw_signature,
-                CommitmentConfig::recent(),
+                CommitmentConfig::processed(),
             )
             .unwrap();
 
@@ -529,7 +529,7 @@ mod test {
         rpc_client
             .poll_for_signature_with_commitment(
                 &stake4_initialize_signature,
-                CommitmentConfig::recent(),
+                CommitmentConfig::processed(),
             )
             .unwrap();
 
@@ -560,7 +560,7 @@ mod test {
         rpc_client
             .poll_for_signature_with_commitment(
                 &stake45_split_signature,
-                CommitmentConfig::recent(),
+                CommitmentConfig::processed(),
             )
             .unwrap();
 
@@ -577,12 +577,15 @@ mod test {
             ))
             .unwrap();
         rpc_client
-            .poll_for_signature_with_commitment(&fund_system1_signature, CommitmentConfig::recent())
+            .poll_for_signature_with_commitment(
+                &fund_system1_signature,
+                CommitmentConfig::processed(),
+            )
             .unwrap();
         accounts_info.enroll_system_account(
             &system1_keypair.pubkey(),
             rpc_client
-                .get_slot_with_commitment(CommitmentConfig::recent())
+                .get_slot_with_commitment(CommitmentConfig::processed())
                 .unwrap(),
             2 * one_sol,
         );
@@ -616,12 +619,15 @@ mod test {
             ))
             .unwrap();
         rpc_client
-            .poll_for_signature_with_commitment(&fund_system2_signature, CommitmentConfig::recent())
+            .poll_for_signature_with_commitment(
+                &fund_system2_signature,
+                CommitmentConfig::processed(),
+            )
             .unwrap();
         accounts_info.enroll_system_account(
             &system2_keypair.pubkey(),
             rpc_client
-                .get_slot_with_commitment(CommitmentConfig::recent())
+                .get_slot_with_commitment(CommitmentConfig::processed())
                 .unwrap(),
             2 * one_sol,
         );
@@ -644,7 +650,7 @@ mod test {
 
         // Process all the transactions
         let current_slot = rpc_client
-            .get_slot_with_commitment(CommitmentConfig::recent())
+            .get_slot_with_commitment(CommitmentConfig::processed())
             .unwrap();
         process_slots(&rpc_client, &mut accounts_info, current_slot + 1);
 

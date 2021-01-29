@@ -1,11 +1,12 @@
 //! @brief Example Rust-based BPF noop program
 
-extern crate solana_sdk;
-use solana_sdk::{
+extern crate solana_program;
+use solana_program::{
     account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
 };
 
 entrypoint!(process_instruction);
+#[allow(clippy::unnecessary_wraps)]
 fn process_instruction(
     _program_id: &Pubkey,
     _accounts: &[AccountInfo],

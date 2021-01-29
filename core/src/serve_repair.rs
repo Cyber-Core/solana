@@ -8,6 +8,7 @@ use crate::{
     weighted_shuffle::weighted_best,
 };
 use bincode::serialize;
+use rand::distributions::{Distribution, WeightedIndex};
 use solana_ledger::{blockstore::Blockstore, shred::Nonce};
 use solana_measure::measure::Measure;
 use solana_measure::thread_mem_usage;
@@ -21,7 +22,7 @@ use solana_sdk::{
 };
 use solana_streamer::streamer::{PacketReceiver, PacketSender};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     net::SocketAddr,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, RwLock},
@@ -80,7 +81,7 @@ pub struct ServeRepair {
     cluster_info: Arc<ClusterInfo>,
 }
 
-type RepairCache = HashMap<Slot, (Vec<ContactInfo>, Vec<(u64, usize)>)>;
+type RepairCache = HashMap<Slot, (Vec<ContactInfo>, WeightedIndex<u64>)>;
 
 impl ServeRepair {
     /// Without a valid keypair gossip will not function. Only useful for tests.
@@ -387,16 +388,20 @@ impl ServeRepair {
         // find a peer that appears to be accepting replication and has the desired slot, as indicated
         // by a valid tvu port location
         let slot = repair_request.slot();
-        if cache.get(&slot).is_none() {
-            let repair_peers = self.repair_peers(&repair_validators, slot);
-            if repair_peers.is_empty() {
-                return Err(ClusterInfoError::NoPeers.into());
+        let (repair_peers, weighted_index) = match cache.entry(slot) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let repair_peers = self.repair_peers(&repair_validators, slot);
+                if repair_peers.is_empty() {
+                    return Err(Error::from(ClusterInfoError::NoPeers));
+                }
+                let weights = cluster_slots.compute_weights(slot, &repair_peers);
+                debug_assert_eq!(weights.len(), repair_peers.len());
+                let weighted_index = WeightedIndex::new(weights)?;
+                entry.insert((repair_peers, weighted_index))
             }
-            let weights = cluster_slots.compute_weights(slot, &repair_peers);
-            cache.insert(slot, (repair_peers, weights));
-        }
-        let (repair_peers, weights) = cache.get(&slot).unwrap();
-        let n = weighted_best(&weights, solana_sdk::pubkey::new_rand().to_bytes());
+        };
+        let n = weighted_index.sample(&mut rand::thread_rng());
         let addr = repair_peers[n].serve_repair; // send the request to the peer's serve_repair port
         let repair_peer_id = repair_peers[n].id;
         let out = self.map_repair_request(
@@ -685,7 +690,7 @@ mod tests {
                 repair: socketaddr!("127.0.0.1:1237"),
                 tpu: socketaddr!("127.0.0.1:1238"),
                 tpu_forwards: socketaddr!("127.0.0.1:1239"),
-                rpc_banks: socketaddr!("127.0.0.1:1240"),
+                unused: socketaddr!("127.0.0.1:1240"),
                 rpc: socketaddr!("127.0.0.1:1241"),
                 rpc_pubsub: socketaddr!("127.0.0.1:1242"),
                 serve_repair: socketaddr!("127.0.0.1:1243"),
@@ -703,11 +708,15 @@ mod tests {
                 nonce,
             );
             assert!(rv.is_none());
-            let mut common_header = ShredCommonHeader::default();
-            common_header.slot = slot;
-            common_header.index = 1;
-            let mut data_header = DataShredHeader::default();
-            data_header.parent_offset = 1;
+            let common_header = ShredCommonHeader {
+                slot,
+                index: 1,
+                ..ShredCommonHeader::default()
+            };
+            let data_header = DataShredHeader {
+                parent_offset: 1,
+                ..DataShredHeader::default()
+            };
             let shred_info = Shred::new_empty_from_header(
                 common_header,
                 data_header,
@@ -769,7 +778,7 @@ mod tests {
             repair: socketaddr!([127, 0, 0, 1], 1237),
             tpu: socketaddr!([127, 0, 0, 1], 1238),
             tpu_forwards: socketaddr!([127, 0, 0, 1], 1239),
-            rpc_banks: socketaddr!([127, 0, 0, 1], 1240),
+            unused: socketaddr!([127, 0, 0, 1], 1240),
             rpc: socketaddr!([127, 0, 0, 1], 1241),
             rpc_pubsub: socketaddr!([127, 0, 0, 1], 1242),
             serve_repair: serve_repair_addr,
@@ -798,7 +807,7 @@ mod tests {
             repair: socketaddr!([127, 0, 0, 1], 1237),
             tpu: socketaddr!([127, 0, 0, 1], 1238),
             tpu_forwards: socketaddr!([127, 0, 0, 1], 1239),
-            rpc_banks: socketaddr!([127, 0, 0, 1], 1240),
+            unused: socketaddr!([127, 0, 0, 1], 1240),
             rpc: socketaddr!([127, 0, 0, 1], 1241),
             rpc_pubsub: socketaddr!([127, 0, 0, 1], 1242),
             serve_repair: serve_repair_addr2,

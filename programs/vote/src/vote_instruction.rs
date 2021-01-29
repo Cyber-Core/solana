@@ -10,14 +10,15 @@ use num_derive::{FromPrimitive, ToPrimitive};
 use serde_derive::{Deserialize, Serialize};
 use solana_metrics::inc_new_counter_info;
 use solana_sdk::{
-    account::{get_signers, next_keyed_account, KeyedAccount},
     decode_error::DecodeError,
     hash::Hash,
     instruction::{AccountMeta, Instruction, InstructionError},
+    keyed_account::{from_keyed_account, get_signers, next_keyed_account, KeyedAccount},
+    process_instruction::InvokeContext,
     program_utils::limited_deserialize,
     pubkey::Pubkey,
     system_instruction,
-    sysvar::{self, clock::Clock, slot_hashes::SlotHashes, Sysvar},
+    sysvar::{self, clock::Clock, slot_hashes::SlotHashes},
 };
 use std::collections::HashSet;
 use thiserror::Error;
@@ -261,10 +262,23 @@ pub fn withdraw(
     Instruction::new(id(), &VoteInstruction::Withdraw(lamports), account_metas)
 }
 
+fn verify_rent_exemption(
+    keyed_account: &KeyedAccount,
+    rent_sysvar_account: &KeyedAccount,
+) -> Result<(), InstructionError> {
+    let rent: sysvar::rent::Rent = from_keyed_account(rent_sysvar_account)?;
+    if !rent.is_exempt(keyed_account.lamports()?, keyed_account.data_len()?) {
+        Err(InstructionError::InsufficientFunds)
+    } else {
+        Ok(())
+    }
+}
+
 pub fn process_instruction(
     _program_id: &Pubkey,
     keyed_accounts: &[KeyedAccount],
     data: &[u8],
+    _invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
     trace!("process_instruction: {:?}", data);
     trace!("keyed_accounts: {:?}", keyed_accounts);
@@ -276,12 +290,12 @@ pub fn process_instruction(
 
     match limited_deserialize(data)? {
         VoteInstruction::InitializeAccount(vote_init) => {
-            sysvar::rent::verify_rent_exemption(me, next_keyed_account(keyed_accounts)?)?;
+            verify_rent_exemption(me, next_keyed_account(keyed_accounts)?)?;
             vote_state::initialize_account(
                 me,
                 &vote_init,
                 &signers,
-                &Clock::from_keyed_account(next_keyed_account(keyed_accounts)?)?,
+                &from_keyed_account::<Clock>(next_keyed_account(keyed_accounts)?)?,
             )
         }
         VoteInstruction::Authorize(voter_pubkey, vote_authorize) => vote_state::authorize(
@@ -289,7 +303,7 @@ pub fn process_instruction(
             &voter_pubkey,
             vote_authorize,
             &signers,
-            &Clock::from_keyed_account(next_keyed_account(keyed_accounts)?)?,
+            &from_keyed_account::<Clock>(next_keyed_account(keyed_accounts)?)?,
         ),
         VoteInstruction::UpdateValidatorIdentity => vote_state::update_validator_identity(
             me,
@@ -303,8 +317,8 @@ pub fn process_instruction(
             inc_new_counter_info!("vote-native", 1);
             vote_state::process_vote(
                 me,
-                &SlotHashes::from_keyed_account(next_keyed_account(keyed_accounts)?)?,
-                &Clock::from_keyed_account(next_keyed_account(keyed_accounts)?)?,
+                &from_keyed_account::<SlotHashes>(next_keyed_account(keyed_accounts)?)?,
+                &from_keyed_account::<Clock>(next_keyed_account(keyed_accounts)?)?,
                 &vote,
                 &signers,
             )
@@ -319,14 +333,23 @@ pub fn process_instruction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::{account::Account, rent::Rent};
+    use solana_sdk::{
+        account::{self, Account},
+        process_instruction::MockInvokeContext,
+        rent::Rent,
+    };
     use std::cell::RefCell;
 
     // these are for 100% coverage in this file
     #[test]
     fn test_vote_process_instruction_decode_bail() {
         assert_eq!(
-            super::process_instruction(&Pubkey::default(), &[], &[],),
+            super::process_instruction(
+                &Pubkey::default(),
+                &[],
+                &[],
+                &mut MockInvokeContext::default()
+            ),
             Err(InstructionError::NotEnoughAccountKeys),
         );
     }
@@ -338,11 +361,11 @@ mod tests {
             .iter()
             .map(|meta| {
                 RefCell::new(if sysvar::clock::check_id(&meta.pubkey) {
-                    Clock::default().create_account(1)
+                    account::create_account(&Clock::default(), 1)
                 } else if sysvar::slot_hashes::check_id(&meta.pubkey) {
-                    SlotHashes::default().create_account(1)
+                    account::create_account(&SlotHashes::default(), 1)
                 } else if sysvar::rent::check_id(&meta.pubkey) {
-                    Rent::free().create_account(1)
+                    account::create_account(&Rent::free(), 1)
                 } else {
                     Account::default()
                 })
@@ -359,7 +382,12 @@ mod tests {
                 .zip(accounts.iter())
                 .map(|(meta, account)| KeyedAccount::new(&meta.pubkey, meta.is_signer, account))
                 .collect();
-            super::process_instruction(&Pubkey::default(), &keyed_accounts, &instruction.data)
+            super::process_instruction(
+                &Pubkey::default(),
+                &keyed_accounts,
+                &instruction.data,
+                &mut MockInvokeContext::default(),
+            )
         }
     }
 

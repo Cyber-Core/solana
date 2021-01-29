@@ -108,10 +108,16 @@ declare module '@solana/web3.js' {
     searchTransactionHistory: boolean,
   };
 
+  declare export type TransactionConfirmationStatus =
+    | 'processed'
+    | 'confirmed'
+    | 'finalized';
+
   declare export type SignatureStatus = {
     slot: number,
     err: TransactionError | null,
     confirmations: number | null,
+    confirmationStatus: TransactionConfirmationStatus | null,
   };
 
   declare export type ConfirmedSignatureInfo = {
@@ -119,6 +125,7 @@ declare module '@solana/web3.js' {
     slot: number,
     err: TransactionError | null,
     memo: string | null,
+    blockTime?: number | null,
   };
 
   declare export type BlockhashAndFeeCalculator = {
@@ -152,11 +159,41 @@ declare module '@solana/web3.js' {
     logs: Array<string> | null,
   };
 
+  declare export type CompiledInnerInstruction = {
+    index: number,
+    instructions: CompiledInstruction[],
+  };
+
+  declare export type TokenBalance = {
+    accountIndex: number,
+    mint: string,
+    uiTokenAmount: TokenAmount,
+  };
+
   declare export type ConfirmedTransactionMeta = {
     fee: number,
+    innerInstructions?: CompiledInnerInstruction[],
     preBalances: Array<number>,
     postBalances: Array<number>,
     logMessages?: Array<string>,
+    preTokenBalances?: Array<TokenBalance>,
+    postTokenBalances?: Array<TokenBalance>,
+    err: TransactionError | null,
+  };
+
+  declare export type ParsedInnerInstruction = {
+    index: number,
+    instructions: (ParsedInstruction | PartiallyDecodedInstruction)[],
+  };
+
+  declare export type ParsedConfirmedTransactionMeta = {
+    fee: number,
+    innerInstructions?: ParsedInnerInstruction[],
+    preBalances: Array<number>,
+    postBalances: Array<number>,
+    logMessages?: Array<string>,
+    preTokenBalances?: Array<TokenBalance>,
+    postTokenBalances?: Array<TokenBalance>,
     err: TransactionError | null,
   };
 
@@ -167,6 +204,12 @@ declare module '@solana/web3.js' {
     transactions: Array<{
       transaction: Transaction,
       meta: ConfirmedTransactionMeta | null,
+    }>,
+    rewards: Array<{
+      pubkey: string,
+      lamports: number,
+      postBalance: number | null,
+      rewardType: string | null,
     }>,
   };
 
@@ -181,6 +224,7 @@ declare module '@solana/web3.js' {
     slot: number,
     transaction: Transaction,
     meta: ConfirmedTransactionMeta | null,
+    blockTime?: number | null,
   };
 
   declare export type ParsedAccountData = {
@@ -225,7 +269,7 @@ declare module '@solana/web3.js' {
   declare export type ParsedConfirmedTransaction = {
     slot: number,
     transaction: ParsedTransaction,
-    meta: ConfirmedTransactionMeta | null,
+    meta: ParsedConfirmedTransactionMeta | null,
   };
 
   declare export type KeyedAccountInfo = {
@@ -536,6 +580,7 @@ declare module '@solana/web3.js' {
   declare export var SYSVAR_RENT_PUBKEY;
   declare export var SYSVAR_REWARDS_PUBKEY;
   declare export var SYSVAR_STAKE_HISTORY_PUBKEY;
+  declare export var SYSVAR_INSTRUCTIONS_PUBKEY;
 
   // === src/vote-account.js ===
   declare export var VOTE_PROGRAM_ID;
@@ -600,6 +645,7 @@ declare module '@solana/web3.js' {
     instructions: CompiledInstruction[];
 
     constructor(args: MessageArgs): Message;
+    static from(buffer: Buffer | Uint8Array | Array<number>): Message;
     isAccountWritable(index: number): boolean;
     serialize(): Buffer;
   }
@@ -643,6 +689,7 @@ declare module '@solana/web3.js' {
     recentBlockhash?: Blockhash,
     nonceInfo?: NonceInformation,
     signatures?: Array<SignaturePubkeyPair>,
+    feePayer?: PublicKey,
   |};
 
   declare export type SerializeConfig = {
@@ -656,7 +703,7 @@ declare module '@solana/web3.js' {
     instructions: Array<TransactionInstruction>;
     recentBlockhash: ?Blockhash;
     nonceInfo: ?NonceInformation;
-    feePayer: PublicKey | null;
+    feePayer: ?PublicKey;
 
     constructor(opts?: TransactionCtorFields): Transaction;
     static from(buffer: Buffer | Uint8Array | Array<number>): Transaction;
@@ -733,6 +780,7 @@ declare module '@solana/web3.js' {
     authorizedPubkey: PublicKey,
     newAuthorizedPubkey: PublicKey,
     stakeAuthorizationType: StakeAuthorizationType,
+    custodianPubkey?: PublicKey,
   |};
 
   declare export type AuthorizeWithSeedStakeParams = {|
@@ -742,6 +790,7 @@ declare module '@solana/web3.js' {
     authorityOwner: PublicKey,
     newAuthorizedPubkey: PublicKey,
     stakeAuthorizationType: StakeAuthorizationType,
+    custodianPubkey?: PublicKey,
   |};
 
   declare export type SplitStakeParams = {|
@@ -756,6 +805,7 @@ declare module '@solana/web3.js' {
     authorizedPubkey: PublicKey,
     toPubkey: PublicKey,
     lamports: number,
+    custodianPubkey?: PublicKey,
   |};
 
   declare export type DeactivateStakeParams = {|
@@ -772,6 +822,7 @@ declare module '@solana/web3.js' {
     ): Transaction;
     static delegate(params: DelegateStakeParams): Transaction;
     static authorize(params: AuthorizeStakeParams): Transaction;
+    static authorizeWithSeed(params: AuthorizeWithSeedStakeParams): Transaction;
     static split(params: SplitStakeParams): Transaction;
     static withdraw(params: WithdrawStakeParams): Transaction;
     static deactivate(params: DeactivateStakeParams): Transaction;
@@ -803,6 +854,9 @@ declare module '@solana/web3.js' {
     static decodeAuthorize(
       instruction: TransactionInstruction,
     ): AuthorizeStakeParams;
+    static decodeAuthorizeWithSeed(
+      instruction: TransactionInstruction,
+    ): AuthorizeWithSeedStakeParams;
     static decodeSplit(instruction: TransactionInstruction): SplitStakeParams;
     static decodeWithdraw(
       instruction: TransactionInstruction,
@@ -862,6 +916,15 @@ declare module '@solana/web3.js' {
     lamports: number,
   |};
 
+  declare export type TransferWithSeedParams = {|
+    fromPubkey: PublicKey,
+    basePubkey: PublicKey,
+    toPubkey: PublicKey,
+    lamports: number,
+    seed: string,
+    programId: PublicKey,
+  |};
+
   declare export type CreateNonceAccountParams = {|
     fromPubkey: PublicKey,
     noncePubkey: PublicKey,
@@ -914,7 +977,9 @@ declare module '@solana/web3.js' {
     static assign(
       params: AssignParams | AssignWithSeedParams,
     ): TransactionInstruction;
-    static transfer(params: TransferParams): TransactionInstruction;
+    static transfer(
+      params: TransferParams | TransferWithSeedParams,
+    ): TransactionInstruction;
     static createNonceAccount(
       params: CreateNonceAccountParams | CreateNonceAccountWithSeedParams,
     ): Transaction;
@@ -931,6 +996,7 @@ declare module '@solana/web3.js' {
     | 'Assign'
     | 'AssignWithSeed'
     | 'Transfer'
+    | 'TransferWithSeed'
     | 'AdvanceNonceAccount'
     | 'WithdrawNonceAccount'
     | 'InitializeNonceAccount'
@@ -959,6 +1025,9 @@ declare module '@solana/web3.js' {
       instruction: TransactionInstruction,
     ): AssignWithSeedParams;
     static decodeTransfer(instruction: TransactionInstruction): TransferParams;
+    static decodeTransferWithSeed(
+      instruction: TransactionInstruction,
+    ): TransferWithSeedParams;
     static decodeNonceInitialize(
       instruction: TransactionInstruction,
     ): InitializeNonceParams;
@@ -971,6 +1040,31 @@ declare module '@solana/web3.js' {
     static decodeNonceAuthorize(
       instruction: TransactionInstruction,
     ): AuthorizeNonceParams;
+  }
+
+  // === src/secp256k1-program.js ===
+  declare export type CreateSecp256k1InstructionWithPublicKeyParams = {|
+    publicKey: Buffer | Uint8Array | Array<number>,
+    message: Buffer | Uint8Array | Array<number>,
+    signature: Buffer | Uint8Array | Array<number>,
+    recoveryId: number,
+  |};
+
+  declare export type CreateSecp256k1InstructionWithPrivateKeyParams = {|
+    privateKey: Buffer | Uint8Array | Array<number>,
+    message: Buffer | Uint8Array | Array<number>,
+  |};
+
+  declare export class Secp256k1Program {
+    static get programId(): PublicKey;
+
+    static createInstructionWithPublicKey(
+      params: CreateSecp256k1InstructionWithPublicKeyParams,
+    ): TransactionInstruction;
+
+    static createInstructionWithPrivateKey(
+      params: CreateSecp256k1InstructionWithPrivateKeyParams,
+    ): TransactionInstruction;
   }
 
   // === src/loader.js ===

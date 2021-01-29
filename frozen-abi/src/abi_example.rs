@@ -188,6 +188,7 @@ example_impls! { f32, 0.0f32 }
 example_impls! { f64, 0.0f64 }
 example_impls! { String, String::new() }
 example_impls! { std::time::Duration, std::time::Duration::from_secs(0) }
+example_impls! { std::sync::Once, std::sync::Once::new() }
 
 use std::sync::atomic::*;
 
@@ -414,9 +415,9 @@ impl<T: std::cmp::Ord + AbiExample> AbiExample for BTreeSet<T> {
 }
 
 #[cfg(not(target_arch = "bpf"))]
-impl AbiExample for memmap::MmapMut {
+impl AbiExample for memmap2::MmapMut {
     fn example() -> Self {
-        memmap::MmapMut::map_anon(1).expect("failed to map the data file")
+        memmap2::MmapMut::map_anon(1).expect("failed to map the data file")
     }
 }
 

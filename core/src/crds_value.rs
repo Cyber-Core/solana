@@ -1,19 +1,26 @@
-use crate::contact_info::ContactInfo;
-use crate::deprecated;
-use crate::epoch_slots::EpochSlots;
+use crate::{
+    cluster_info::MAX_SNAPSHOT_HASHES,
+    contact_info::ContactInfo,
+    deprecated,
+    duplicate_shred::{DuplicateShred, DuplicateShredIndex, MAX_DUPLICATE_SHREDS},
+    epoch_slots::EpochSlots,
+};
 use bincode::{serialize, serialized_size};
+use rand::{CryptoRng, Rng};
+use serde::de::{Deserialize, Deserializer};
 use solana_sdk::sanitize::{Sanitize, SanitizeError};
 use solana_sdk::timing::timestamp;
 use solana_sdk::{
     clock::Slot,
     hash::Hash,
-    pubkey::Pubkey,
-    signature::{Keypair, Signable, Signature},
+    pubkey::{self, Pubkey},
+    signature::{Keypair, Signable, Signature, Signer},
     transaction::Transaction,
 };
+use solana_vote_program::vote_transaction::parse_vote_transaction;
 use std::{
     borrow::{Borrow, Cow},
-    collections::{BTreeSet, HashSet},
+    collections::{hash_map::Entry, BTreeSet, HashMap},
     fmt,
 };
 
@@ -21,6 +28,8 @@ pub const MAX_WALLCLOCK: u64 = 1_000_000_000_000_000;
 pub const MAX_SLOT: u64 = 1_000_000_000_000_000;
 
 pub type VoteIndex = u8;
+// TODO: Remove this in favor of vote_state::MAX_LOCKOUT_HISTORY once
+// the fleet is updated to the new ClusterInfo::push_vote code.
 pub const MAX_VOTES: VoteIndex = 32;
 
 pub type EpochSlotsIndex = u8;
@@ -77,6 +86,8 @@ pub enum CrdsData {
     EpochSlots(EpochSlotsIndex, EpochSlots),
     LegacyVersion(LegacyVersion),
     Version(Version),
+    NodeInstance(NodeInstance),
+    DuplicateShred(DuplicateShredIndex, DuplicateShred),
 }
 
 impl Sanitize for CrdsData {
@@ -105,6 +116,38 @@ impl Sanitize for CrdsData {
             }
             CrdsData::LegacyVersion(version) => version.sanitize(),
             CrdsData::Version(version) => version.sanitize(),
+            CrdsData::NodeInstance(node) => node.sanitize(),
+            CrdsData::DuplicateShred(ix, shred) => {
+                if *ix >= MAX_DUPLICATE_SHREDS {
+                    Err(SanitizeError::ValueOutOfBounds)
+                } else {
+                    shred.sanitize()
+                }
+            }
+        }
+    }
+}
+
+/// Random timestamp for tests and benchmarks.
+pub(crate) fn new_rand_timestamp<R: Rng>(rng: &mut R) -> u64 {
+    const DELAY: u64 = 10 * 60 * 1000; // 10 minutes
+    timestamp() - DELAY + rng.gen_range(0, 2 * DELAY)
+}
+
+impl CrdsData {
+    /// New random CrdsData for tests and benchmarks.
+    fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> CrdsData {
+        let kind = rng.gen_range(0, 6);
+        // TODO: Implement other kinds of CrdsData here.
+        // TODO: Assign ranges to each arm proportional to their frequency in
+        // the mainnet crds table.
+        match kind {
+            0 => CrdsData::ContactInfo(ContactInfo::new_rand(rng, pubkey)),
+            1 => CrdsData::LowestSlot(rng.gen(), LowestSlot::new_rand(rng, pubkey)),
+            2 => CrdsData::SnapshotHashes(SnapshotHash::new_rand(rng, pubkey)),
+            3 => CrdsData::AccountsHashes(SnapshotHash::new_rand(rng, pubkey)),
+            4 => CrdsData::Version(Version::new_rand(rng, pubkey)),
+            _ => CrdsData::Vote(rng.gen_range(0, MAX_VOTES), Vote::new_rand(rng, pubkey)),
         }
     }
 }
@@ -118,9 +161,7 @@ pub struct SnapshotHash {
 
 impl Sanitize for SnapshotHash {
     fn sanitize(&self) -> Result<(), SanitizeError> {
-        if self.wallclock >= MAX_WALLCLOCK {
-            return Err(SanitizeError::ValueOutOfBounds);
-        }
+        sanitize_wallclock(self.wallclock)?;
         for (slot, _) in &self.hashes {
             if *slot >= MAX_SLOT {
                 return Err(SanitizeError::ValueOutOfBounds);
@@ -136,6 +177,23 @@ impl SnapshotHash {
             from,
             hashes,
             wallclock: timestamp(),
+        }
+    }
+
+    /// New random SnapshotHash for tests and benchmarks.
+    pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        let num_hashes = rng.gen_range(0, MAX_SNAPSHOT_HASHES) + 1;
+        let hashes = std::iter::repeat_with(|| {
+            let slot = 47825632 + rng.gen_range(0, 512);
+            let hash = solana_sdk::hash::new_rand(rng);
+            (slot, hash)
+        })
+        .take(num_hashes)
+        .collect();
+        Self {
+            from: pubkey.unwrap_or_else(pubkey::new_rand),
+            hashes,
+            wallclock: new_rand_timestamp(rng),
         }
     }
 }
@@ -160,13 +218,23 @@ impl LowestSlot {
             wallclock,
         }
     }
+
+    /// New random LowestSlot for tests and benchmarks.
+    fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        Self {
+            from: pubkey.unwrap_or_else(pubkey::new_rand),
+            root: rng.gen(),
+            lowest: rng.gen(),
+            slots: BTreeSet::default(),
+            stash: Vec::default(),
+            wallclock: new_rand_timestamp(rng),
+        }
+    }
 }
 
 impl Sanitize for LowestSlot {
     fn sanitize(&self) -> Result<(), SanitizeError> {
-        if self.wallclock >= MAX_WALLCLOCK {
-            return Err(SanitizeError::ValueOutOfBounds);
-        }
+        sanitize_wallclock(self.wallclock)?;
         if self.lowest >= MAX_SLOT {
             return Err(SanitizeError::ValueOutOfBounds);
         }
@@ -183,30 +251,76 @@ impl Sanitize for LowestSlot {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, AbiExample)]
+#[derive(Clone, Debug, PartialEq, AbiExample, Serialize)]
 pub struct Vote {
-    pub from: Pubkey,
-    pub transaction: Transaction,
-    pub wallclock: u64,
+    pub(crate) from: Pubkey,
+    transaction: Transaction,
+    pub(crate) wallclock: u64,
+    #[serde(skip_serializing)]
+    slot: Option<Slot>,
 }
 
 impl Sanitize for Vote {
     fn sanitize(&self) -> Result<(), SanitizeError> {
-        if self.wallclock >= MAX_WALLCLOCK {
-            return Err(SanitizeError::ValueOutOfBounds);
-        }
+        sanitize_wallclock(self.wallclock)?;
         self.from.sanitize()?;
         self.transaction.sanitize()
     }
 }
 
 impl Vote {
-    pub fn new(from: &Pubkey, transaction: Transaction, wallclock: u64) -> Self {
+    pub fn new(from: Pubkey, transaction: Transaction, wallclock: u64) -> Self {
+        let slot = parse_vote_transaction(&transaction)
+            .and_then(|(_, vote, _)| vote.slots.last().copied());
         Self {
-            from: *from,
+            from,
             transaction,
             wallclock,
+            slot,
         }
+    }
+
+    /// New random Vote for tests and benchmarks.
+    fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        Self {
+            from: pubkey.unwrap_or_else(pubkey::new_rand),
+            transaction: Transaction::default(),
+            wallclock: new_rand_timestamp(rng),
+            slot: None,
+        }
+    }
+
+    pub(crate) fn transaction(&self) -> &Transaction {
+        &self.transaction
+    }
+
+    pub(crate) fn slot(&self) -> Option<Slot> {
+        self.slot
+    }
+}
+
+impl<'de> Deserialize<'de> for Vote {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Vote {
+            from: Pubkey,
+            transaction: Transaction,
+            wallclock: u64,
+        }
+        let vote = Vote::deserialize(deserializer)?;
+        let vote = match vote.transaction.sanitize() {
+            Ok(_) => Self::new(vote.from, vote.transaction, vote.wallclock),
+            Err(_) => Self {
+                from: vote.from,
+                transaction: vote.transaction,
+                wallclock: vote.wallclock,
+                slot: None,
+            },
+        };
+        Ok(vote)
     }
 }
 
@@ -219,9 +333,7 @@ pub struct LegacyVersion {
 
 impl Sanitize for LegacyVersion {
     fn sanitize(&self) -> Result<(), SanitizeError> {
-        if self.wallclock >= MAX_WALLCLOCK {
-            return Err(SanitizeError::ValueOutOfBounds);
-        }
+        sanitize_wallclock(self.wallclock)?;
         self.from.sanitize()?;
         self.version.sanitize()
     }
@@ -236,9 +348,7 @@ pub struct Version {
 
 impl Sanitize for Version {
     fn sanitize(&self) -> Result<(), SanitizeError> {
-        if self.wallclock >= MAX_WALLCLOCK {
-            return Err(SanitizeError::ValueOutOfBounds);
-        }
+        sanitize_wallclock(self.wallclock)?;
         self.from.sanitize()?;
         self.version.sanitize()
     }
@@ -251,6 +361,71 @@ impl Version {
             wallclock: timestamp(),
             version: solana_version::Version::default(),
         }
+    }
+
+    /// New random Version for tests and benchmarks.
+    fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        Self {
+            from: pubkey.unwrap_or_else(pubkey::new_rand),
+            wallclock: new_rand_timestamp(rng),
+            version: solana_version::Version {
+                major: rng.gen(),
+                minor: rng.gen(),
+                patch: rng.gen(),
+                commit: Some(rng.gen()),
+                feature_set: rng.gen(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, AbiExample, Deserialize, Serialize)]
+pub struct NodeInstance {
+    from: Pubkey,
+    wallclock: u64,
+    timestamp: u64, // Timestamp when the instance was created.
+    token: u64,     // Randomly generated value at node instantiation.
+}
+
+impl NodeInstance {
+    pub fn new<R>(rng: &mut R, pubkey: Pubkey, now: u64) -> Self
+    where
+        R: Rng + CryptoRng,
+    {
+        Self {
+            from: pubkey,
+            wallclock: now,
+            timestamp: now,
+            token: rng.gen(),
+        }
+    }
+
+    // Clones the value with an updated wallclock.
+    pub fn with_wallclock(&self, now: u64) -> Self {
+        Self {
+            wallclock: now,
+            ..*self
+        }
+    }
+
+    // Returns true if the crds-value is a duplicate instance
+    // of this node, with a more recent timestamp.
+    pub fn check_duplicate(&self, other: &CrdsValue) -> bool {
+        match &other.data {
+            CrdsData::NodeInstance(other) => {
+                self.token != other.token
+                    && self.timestamp <= other.timestamp
+                    && self.from == other.from
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Sanitize for NodeInstance {
+    fn sanitize(&self) -> Result<(), SanitizeError> {
+        sanitize_wallclock(self.wallclock)?;
+        self.from.sanitize()
     }
 }
 
@@ -266,6 +441,8 @@ pub enum CrdsValueLabel {
     AccountsHashes(Pubkey),
     LegacyVersion(Pubkey),
     Version(Pubkey),
+    NodeInstance(Pubkey, u64 /*token*/),
+    DuplicateShred(DuplicateShredIndex, Pubkey),
 }
 
 impl fmt::Display for CrdsValueLabel {
@@ -279,6 +456,8 @@ impl fmt::Display for CrdsValueLabel {
             CrdsValueLabel::AccountsHashes(_) => write!(f, "AccountsHashes({})", self.pubkey()),
             CrdsValueLabel::LegacyVersion(_) => write!(f, "LegacyVersion({})", self.pubkey()),
             CrdsValueLabel::Version(_) => write!(f, "Version({})", self.pubkey()),
+            CrdsValueLabel::NodeInstance(pk, token) => write!(f, "NodeInstance({}, {})", pk, token),
+            CrdsValueLabel::DuplicateShred(ix, pk) => write!(f, "DuplicateShred({}, {})", ix, pk),
         }
     }
 }
@@ -294,6 +473,25 @@ impl CrdsValueLabel {
             CrdsValueLabel::AccountsHashes(p) => *p,
             CrdsValueLabel::LegacyVersion(p) => *p,
             CrdsValueLabel::Version(p) => *p,
+            CrdsValueLabel::NodeInstance(p, _ /*token*/) => *p,
+            CrdsValueLabel::DuplicateShred(_, p) => *p,
+        }
+    }
+
+    /// Returns number of possible distinct labels of the same type for
+    /// a fixed pubkey, and None if that is practically unlimited.
+    pub(crate) fn value_space(&self) -> Option<usize> {
+        match self {
+            CrdsValueLabel::ContactInfo(_) => Some(1),
+            CrdsValueLabel::Vote(_, _) => Some(MAX_VOTES as usize),
+            CrdsValueLabel::LowestSlot(_) => Some(1),
+            CrdsValueLabel::SnapshotHashes(_) => Some(1),
+            CrdsValueLabel::EpochSlots(_, _) => Some(MAX_EPOCH_SLOTS as usize),
+            CrdsValueLabel::AccountsHashes(_) => Some(1),
+            CrdsValueLabel::LegacyVersion(_) => Some(1),
+            CrdsValueLabel::Version(_) => Some(1),
+            CrdsValueLabel::NodeInstance(_, _) => None,
+            CrdsValueLabel::DuplicateShred(_, _) => Some(MAX_DUPLICATE_SHREDS as usize),
         }
     }
 }
@@ -312,14 +510,19 @@ impl CrdsValue {
         value
     }
 
-    /// New random crds value for tests and benchmarks.
-    pub fn new_rand<R: ?Sized>(rng: &mut R) -> CrdsValue
-    where
-        R: rand::Rng,
-    {
-        let now = rng.gen();
-        let contact_info = ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), now);
-        Self::new_signed(CrdsData::ContactInfo(contact_info), &Keypair::new())
+    /// New random CrdsValue for tests and benchmarks.
+    pub fn new_rand<R: Rng>(rng: &mut R, keypair: Option<&Keypair>) -> CrdsValue {
+        match keypair {
+            None => {
+                let keypair = Keypair::new();
+                let data = CrdsData::new_rand(rng, Some(keypair.pubkey()));
+                Self::new_signed(data, &keypair)
+            }
+            Some(keypair) => {
+                let data = CrdsData::new_rand(rng, Some(keypair.pubkey()));
+                Self::new_signed(data, keypair)
+            }
+        }
     }
 
     /// Totally unsecure unverifiable wallclock of the node that generated this message
@@ -335,6 +538,8 @@ impl CrdsValue {
             CrdsData::EpochSlots(_, p) => p.wallclock,
             CrdsData::LegacyVersion(version) => version.wallclock,
             CrdsData::Version(version) => version.wallclock,
+            CrdsData::NodeInstance(node) => node.wallclock,
+            CrdsData::DuplicateShred(_, shred) => shred.wallclock,
         }
     }
     pub fn pubkey(&self) -> Pubkey {
@@ -347,6 +552,8 @@ impl CrdsValue {
             CrdsData::EpochSlots(_, p) => p.from,
             CrdsData::LegacyVersion(version) => version.from,
             CrdsData::Version(version) => version.from,
+            CrdsData::NodeInstance(node) => node.from,
+            CrdsData::DuplicateShred(_, shred) => shred.from,
         }
     }
     pub fn label(&self) -> CrdsValueLabel {
@@ -359,6 +566,8 @@ impl CrdsValue {
             CrdsData::EpochSlots(ix, _) => CrdsValueLabel::EpochSlots(*ix, self.pubkey()),
             CrdsData::LegacyVersion(_) => CrdsValueLabel::LegacyVersion(self.pubkey()),
             CrdsData::Version(_) => CrdsValueLabel::Version(self.pubkey()),
+            CrdsData::NodeInstance(node) => CrdsValueLabel::NodeInstance(node.from, node.token),
+            CrdsData::DuplicateShred(ix, shred) => CrdsValueLabel::DuplicateShred(*ix, shred.from),
         }
     }
     pub fn contact_info(&self) -> Option<&ContactInfo> {
@@ -367,16 +576,11 @@ impl CrdsValue {
             _ => None,
         }
     }
-    pub fn vote(&self) -> Option<&Vote> {
+
+    #[cfg(test)]
+    fn vote(&self) -> Option<&Vote> {
         match &self.data {
             CrdsData::Vote(_, vote) => Some(vote),
-            _ => None,
-        }
-    }
-
-    pub fn vote_index(&self) -> Option<VoteIndex> {
-        match &self.data {
-            CrdsData::Vote(ix, _) => Some(*ix),
             _ => None,
         }
     }
@@ -423,51 +627,50 @@ impl CrdsValue {
         }
     }
 
-    /// Return all the possible labels for a record identified by Pubkey.
-    pub fn record_labels(key: &Pubkey) -> Vec<CrdsValueLabel> {
-        let mut labels = vec![
-            CrdsValueLabel::ContactInfo(*key),
-            CrdsValueLabel::LowestSlot(*key),
-            CrdsValueLabel::SnapshotHashes(*key),
-            CrdsValueLabel::AccountsHashes(*key),
-            CrdsValueLabel::LegacyVersion(*key),
-            CrdsValueLabel::Version(*key),
-        ];
-        labels.extend((0..MAX_VOTES).map(|ix| CrdsValueLabel::Vote(ix, *key)));
-        labels.extend((0..MAX_EPOCH_SLOTS).map(|ix| CrdsValueLabel::EpochSlots(ix, *key)));
-        labels
-    }
-
     /// Returns the size (in bytes) of a CrdsValue
     pub fn size(&self) -> u64 {
         serialized_size(&self).expect("unable to serialize contact info")
     }
 
-    pub fn compute_vote_index(tower_index: usize, mut votes: Vec<&CrdsValue>) -> VoteIndex {
-        let mut available: HashSet<VoteIndex> = (0..MAX_VOTES).collect();
-        votes.iter().filter_map(|v| v.vote_index()).for_each(|ix| {
-            available.remove(&ix);
-        });
-
-        // free index
-        if !available.is_empty() {
-            return *available.iter().next().unwrap();
+    /// Returns true if, regardless of prunes, this crds-value
+    /// should be pushed to the receiving node.
+    pub fn should_force_push(&self, peer: &Pubkey) -> bool {
+        match &self.data {
+            CrdsData::NodeInstance(node) => node.from == *peer,
+            _ => false,
         }
+    }
+}
 
-        assert!(votes.len() == MAX_VOTES as usize);
-        votes.sort_by_key(|v| v.vote().expect("all values must be votes").wallclock);
-
-        // If Tower is full, oldest removed first
-        if tower_index + 1 == MAX_VOTES as usize {
-            return votes[0].vote_index().expect("all values must be votes");
+/// Filters out an iterator of crds values, returning
+/// the unique ones with the most recent wallclock.
+pub(crate) fn filter_current<'a, I>(values: I) -> impl Iterator<Item = &'a CrdsValue>
+where
+    I: IntoIterator<Item = &'a CrdsValue>,
+{
+    let mut out = HashMap::new();
+    for value in values {
+        match out.entry(value.label()) {
+            Entry::Vacant(entry) => {
+                entry.insert((value, value.wallclock()));
+            }
+            Entry::Occupied(mut entry) => {
+                let value_wallclock = value.wallclock();
+                let (_, entry_wallclock) = entry.get();
+                if *entry_wallclock < value_wallclock {
+                    entry.insert((value, value_wallclock));
+                }
+            }
         }
+    }
+    out.into_iter().map(|(_, (v, _))| v)
+}
 
-        // If Tower is not full, the early votes have expired
-        assert!(tower_index < MAX_VOTES as usize);
-
-        votes[tower_index]
-            .vote_index()
-            .expect("all values must be votes")
+pub(crate) fn sanitize_wallclock(wallclock: u64) -> Result<(), SanitizeError> {
+    if wallclock >= MAX_WALLCLOCK {
+        Err(SanitizeError::ValueOutOfBounds)
+    } else {
+        Ok(())
     }
 }
 
@@ -475,31 +678,16 @@ impl CrdsValue {
 mod test {
     use super::*;
     use crate::contact_info::ContactInfo;
-    use bincode::deserialize;
+    use bincode::{deserialize, Options};
+    use rand::SeedableRng;
+    use rand_chacha::ChaChaRng;
     use solana_perf::test_tx::test_tx;
     use solana_sdk::signature::{Keypair, Signer};
     use solana_sdk::timing::timestamp;
+    use solana_vote_program::{vote_instruction, vote_state};
+    use std::cmp::Ordering;
+    use std::iter::repeat_with;
 
-    #[test]
-    fn test_labels() {
-        let mut hits = [false; 6 + MAX_VOTES as usize + MAX_EPOCH_SLOTS as usize];
-        // this method should cover all the possible labels
-        for v in &CrdsValue::record_labels(&Pubkey::default()) {
-            match v {
-                CrdsValueLabel::ContactInfo(_) => hits[0] = true,
-                CrdsValueLabel::LowestSlot(_) => hits[1] = true,
-                CrdsValueLabel::SnapshotHashes(_) => hits[2] = true,
-                CrdsValueLabel::AccountsHashes(_) => hits[3] = true,
-                CrdsValueLabel::LegacyVersion(_) => hits[4] = true,
-                CrdsValueLabel::Version(_) => hits[5] = true,
-                CrdsValueLabel::Vote(ix, _) => hits[*ix as usize + 6] = true,
-                CrdsValueLabel::EpochSlots(ix, _) => {
-                    hits[*ix as usize + MAX_VOTES as usize + 6] = true
-                }
-            }
-        }
-        assert!(hits.iter().all(|x| *x));
-    }
     #[test]
     fn test_keys_and_values() {
         let v = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
@@ -509,7 +697,7 @@ mod test {
 
         let v = CrdsValue::new_unsigned(CrdsData::Vote(
             0,
-            Vote::new(&Pubkey::default(), test_tx(), 0),
+            Vote::new(Pubkey::default(), test_tx(), 0),
         ));
         assert_eq!(v.wallclock(), 0);
         let key = v.vote().unwrap().from;
@@ -561,7 +749,7 @@ mod test {
         verify_signatures(&mut v, &keypair, &wrong_keypair);
         v = CrdsValue::new_unsigned(CrdsData::Vote(
             0,
-            Vote::new(&keypair.pubkey(), test_tx(), timestamp()),
+            Vote::new(keypair.pubkey(), test_tx(), timestamp()),
         ));
         verify_signatures(&mut v, &keypair, &wrong_keypair);
         v = CrdsValue::new_unsigned(CrdsData::LowestSlot(
@@ -577,11 +765,43 @@ mod test {
         let vote = CrdsValue::new_signed(
             CrdsData::Vote(
                 MAX_VOTES,
-                Vote::new(&keypair.pubkey(), test_tx(), timestamp()),
+                Vote::new(keypair.pubkey(), test_tx(), timestamp()),
             ),
             &keypair,
         );
         assert!(vote.sanitize().is_err());
+    }
+
+    #[test]
+    fn test_vote_round_trip() {
+        let mut rng = rand::thread_rng();
+        let vote = vote_state::Vote::new(
+            vec![1, 3, 7], // slots
+            solana_sdk::hash::new_rand(&mut rng),
+        );
+        let ix = vote_instruction::vote(
+            &Pubkey::new_unique(), // vote_pubkey
+            &Pubkey::new_unique(), // authorized_voter_pubkey
+            vote,
+        );
+        let tx = Transaction::new_with_payer(
+            &[ix],                       // instructions
+            Some(&Pubkey::new_unique()), // payer
+        );
+        let vote = Vote::new(
+            Pubkey::new_unique(), // from
+            tx,
+            rng.gen(), // wallclock
+        );
+        assert_eq!(vote.slot, Some(7));
+        let bytes = bincode::serialize(&vote).unwrap();
+        let other = bincode::deserialize(&bytes[..]).unwrap();
+        assert_eq!(vote, other);
+        assert_eq!(other.slot, Some(7));
+        let bytes = bincode::options().serialize(&vote).unwrap();
+        let other = bincode::options().deserialize(&bytes[..]).unwrap();
+        assert_eq!(vote, other);
+        assert_eq!(other.slot, Some(7));
     }
 
     #[test]
@@ -595,49 +815,6 @@ mod test {
             &keypair,
         );
         assert_eq!(item.sanitize(), Err(SanitizeError::ValueOutOfBounds));
-    }
-    #[test]
-    fn test_compute_vote_index_empty() {
-        for i in 0..MAX_VOTES {
-            let votes = vec![];
-            assert!(CrdsValue::compute_vote_index(i as usize, votes) < MAX_VOTES);
-        }
-    }
-
-    #[test]
-    fn test_compute_vote_index_one() {
-        let keypair = Keypair::new();
-        let vote = CrdsValue::new_unsigned(CrdsData::Vote(
-            0,
-            Vote::new(&keypair.pubkey(), test_tx(), 0),
-        ));
-        for i in 0..MAX_VOTES {
-            let votes = vec![&vote];
-            assert!(CrdsValue::compute_vote_index(i as usize, votes) > 0);
-            let votes = vec![&vote];
-            assert!(CrdsValue::compute_vote_index(i as usize, votes) < MAX_VOTES);
-        }
-    }
-
-    #[test]
-    fn test_compute_vote_index_full() {
-        let keypair = Keypair::new();
-        let votes: Vec<_> = (0..MAX_VOTES)
-            .map(|x| {
-                CrdsValue::new_unsigned(CrdsData::Vote(
-                    x,
-                    Vote::new(&keypair.pubkey(), test_tx(), x as u64),
-                ))
-            })
-            .collect();
-        let vote_refs = votes.iter().collect();
-        //pick the oldest vote when full
-        assert_eq!(CrdsValue::compute_vote_index(31, vote_refs), 0);
-        //pick the index
-        let vote_refs = votes.iter().collect();
-        assert_eq!(CrdsValue::compute_vote_index(0, vote_refs), 0);
-        let vote_refs = votes.iter().collect();
-        assert_eq!(CrdsValue::compute_vote_index(30, vote_refs), 30);
     }
 
     fn serialize_deserialize_value(value: &mut CrdsValue, keypair: &Keypair) {
@@ -668,5 +845,168 @@ mod test {
         value.sign(&wrong_keypair);
         assert!(!value.verify());
         serialize_deserialize_value(value, correct_keypair);
+    }
+
+    #[test]
+    fn test_filter_current() {
+        let seed = [48u8; 32];
+        let mut rng = ChaChaRng::from_seed(seed);
+        let keys: Vec<_> = repeat_with(Keypair::new).take(16).collect();
+        let values: Vec<_> = repeat_with(|| {
+            let index = rng.gen_range(0, keys.len());
+            CrdsValue::new_rand(&mut rng, Some(&keys[index]))
+        })
+        .take(2048)
+        .collect();
+        let mut currents = HashMap::new();
+        for value in filter_current(&values) {
+            // Assert that filtered values have unique labels.
+            assert!(currents.insert(value.label(), value).is_none());
+        }
+        // Assert that currents are the most recent version of each value.
+        let mut count = 0;
+        for value in &values {
+            let current_value = currents.get(&value.label()).unwrap();
+            match value.wallclock().cmp(&current_value.wallclock()) {
+                Ordering::Less => (),
+                Ordering::Equal => {
+                    // There is a chance that two randomly generated
+                    // crds-values have the same label and wallclock.
+                    if value == *current_value {
+                        count += 1;
+                    }
+                }
+                Ordering::Greater => panic!("this should not happen!"),
+            }
+        }
+        assert_eq!(count, currents.len());
+        // Currently CrdsData::new_rand is only implemented for 5 different
+        // kinds and excludes EpochSlots, and so the unique labels cannot be
+        // more than (5 + MAX_VOTES) times number of keys.
+        assert!(currents.len() <= keys.len() * (5 + MAX_VOTES as usize));
+    }
+
+    #[test]
+    fn test_node_instance_crds_lable() {
+        fn make_crds_value(node: NodeInstance) -> CrdsValue {
+            CrdsValue::new_unsigned(CrdsData::NodeInstance(node))
+        }
+        let mut rng = rand::thread_rng();
+        let now = timestamp();
+        let pubkey = Pubkey::new_unique();
+        let node = NodeInstance::new(&mut rng, pubkey, now);
+        assert_eq!(
+            make_crds_value(node.clone()).label(),
+            make_crds_value(node.with_wallclock(now + 8)).label()
+        );
+        let other = NodeInstance {
+            from: Pubkey::new_unique(),
+            ..node
+        };
+        assert_ne!(
+            make_crds_value(node.clone()).label(),
+            make_crds_value(other).label()
+        );
+        let other = NodeInstance {
+            wallclock: now + 8,
+            ..node
+        };
+        assert_eq!(
+            make_crds_value(node.clone()).label(),
+            make_crds_value(other).label()
+        );
+        let other = NodeInstance {
+            timestamp: now + 8,
+            ..node
+        };
+        assert_eq!(
+            make_crds_value(node.clone()).label(),
+            make_crds_value(other).label()
+        );
+        let other = NodeInstance {
+            token: rng.gen(),
+            ..node
+        };
+        assert_ne!(
+            make_crds_value(node).label(),
+            make_crds_value(other).label()
+        );
+    }
+
+    #[test]
+    fn test_check_duplicate_instance() {
+        fn make_crds_value(node: NodeInstance) -> CrdsValue {
+            CrdsValue::new_unsigned(CrdsData::NodeInstance(node))
+        }
+        let now = timestamp();
+        let mut rng = rand::thread_rng();
+        let pubkey = Pubkey::new_unique();
+        let node = NodeInstance::new(&mut rng, pubkey, now);
+        // Same token is not a duplicate.
+        assert!(!node.check_duplicate(&make_crds_value(NodeInstance {
+            from: pubkey,
+            wallclock: now + 1,
+            timestamp: now + 1,
+            token: node.token,
+        })));
+        // Older timestamp is not a duplicate.
+        assert!(!node.check_duplicate(&make_crds_value(NodeInstance {
+            from: pubkey,
+            wallclock: now + 1,
+            timestamp: now - 1,
+            token: rng.gen(),
+        })));
+        // Updated wallclock is not a duplicate.
+        let other = node.with_wallclock(now + 8);
+        assert_eq!(
+            other,
+            NodeInstance {
+                from: pubkey,
+                wallclock: now + 8,
+                timestamp: now,
+                token: node.token,
+            }
+        );
+        assert!(!node.check_duplicate(&make_crds_value(other)));
+        // Duplicate instance.
+        assert!(node.check_duplicate(&make_crds_value(NodeInstance {
+            from: pubkey,
+            wallclock: 0,
+            timestamp: now,
+            token: rng.gen(),
+        })));
+        // Different pubkey is not a duplicate.
+        assert!(!node.check_duplicate(&make_crds_value(NodeInstance {
+            from: Pubkey::new_unique(),
+            wallclock: now + 1,
+            timestamp: now + 1,
+            token: rng.gen(),
+        })));
+        // Differnt crds value is not a duplicate.
+        assert!(
+            !node.check_duplicate(&CrdsValue::new_unsigned(CrdsData::ContactInfo(
+                ContactInfo::new_rand(&mut rng, Some(pubkey))
+            )))
+        );
+    }
+
+    #[test]
+    fn test_should_force_push() {
+        let mut rng = rand::thread_rng();
+        let pubkey = Pubkey::new_unique();
+        assert!(
+            !CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_rand(
+                &mut rng,
+                Some(pubkey),
+            )))
+            .should_force_push(&pubkey)
+        );
+        let node = CrdsValue::new_unsigned(CrdsData::NodeInstance(NodeInstance::new(
+            &mut rng,
+            pubkey,
+            timestamp(),
+        )));
+        assert!(node.should_force_push(&pubkey));
+        assert!(!node.should_force_push(&Pubkey::new_unique()));
     }
 }

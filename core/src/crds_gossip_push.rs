@@ -20,7 +20,7 @@ use bincode::serialized_size;
 use indexmap::map::IndexMap;
 use itertools::Itertools;
 use rand::{seq::SliceRandom, Rng};
-use solana_runtime::bloom::Bloom;
+use solana_runtime::bloom::{AtomicBloom, Bloom};
 use solana_sdk::{hash::Hash, packet::PACKET_DATA_SIZE, pubkey::Pubkey, timing::timestamp};
 use std::{
     cmp,
@@ -35,19 +35,18 @@ pub const CRDS_GOSSIP_PUSH_FANOUT: usize = 6;
 pub const CRDS_GOSSIP_PUSH_MSG_TIMEOUT_MS: u64 = 30000;
 pub const CRDS_GOSSIP_PRUNE_MSG_TIMEOUT_MS: u64 = 500;
 pub const CRDS_GOSSIP_PRUNE_STAKE_THRESHOLD_PCT: f64 = 0.15;
-pub const CRDS_GOSSIP_PRUNE_MIN_INGRESS_NODES: usize = 2;
+pub const CRDS_GOSSIP_PRUNE_MIN_INGRESS_NODES: usize = 3;
 // Do not push to peers which have not been updated for this long.
 const PUSH_ACTIVE_TIMEOUT_MS: u64 = 60_000;
 
 // 10 minutes
 const MAX_PUSHED_TO_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
-#[derive(Clone)]
 pub struct CrdsGossipPush {
     /// max bytes per message
     pub max_bytes: usize,
     /// active set of validators for push
-    active_set: IndexMap<Pubkey, Bloom<Pubkey>>,
+    active_set: IndexMap<Pubkey, AtomicBloom<Pubkey>>,
     /// push message queue
     push_messages: HashMap<CrdsValueLabel, Hash>,
     /// Cache that tracks which validators a message was received from
@@ -136,8 +135,12 @@ impl CrdsGossipPush {
 
         let mut keep = HashSet::new();
         let mut peer_stake_sum = 0;
+        keep.insert(*origin);
         for next in shuffle {
             let (next_peer, next_stake) = staked_peers[next];
+            if next_peer == *origin {
+                continue;
+            }
             keep.insert(next_peer);
             peer_stake_sum += next_stake;
             if peer_stake_sum >= prune_stake_threshold
@@ -172,12 +175,7 @@ impl CrdsGossipPush {
         now: u64,
     ) -> Result<Option<VersionedCrdsValue>, CrdsGossipError> {
         self.num_total += 1;
-        if now
-            > value
-                .wallclock()
-                .checked_add(self.msg_timeout)
-                .unwrap_or_else(|| 0)
-        {
+        if now > value.wallclock().checked_add(self.msg_timeout).unwrap_or(0) {
             return Err(CrdsGossipError::PushMessageTimeout);
         }
         if now + self.msg_timeout < value.wallclock() {
@@ -205,7 +203,7 @@ impl CrdsGossipPush {
     /// push pull responses
     pub fn push_pull_responses(&mut self, values: Vec<(CrdsValueLabel, Hash, u64)>, now: u64) {
         for (label, value_hash, wc) in values {
-            if now > wc.checked_add(self.msg_timeout).unwrap_or_else(|| 0) {
+            if now > wc.checked_add(self.msg_timeout).unwrap_or(0) {
                 continue;
             }
             self.push_messages.insert(label, value_hash);
@@ -244,7 +242,7 @@ impl CrdsGossipPush {
             for i in start..(start + push_fanout) {
                 let index = i % self.active_set.len();
                 let (peer, filter) = self.active_set.get_index(index).unwrap();
-                if !filter.contains(&origin) {
+                if !filter.contains(&origin) || value.should_force_push(peer) {
                     trace!("new_push_messages insert {} {:?}", *peer, value);
                     push_messages.entry(*peer).or_default().push(value.clone());
                     num_pushes += 1;
@@ -283,13 +281,12 @@ impl CrdsGossipPush {
     }
 
     /// add the `from` to the peer's filter of nodes
-    pub fn process_prune_msg(&mut self, self_pubkey: &Pubkey, peer: &Pubkey, origins: &[Pubkey]) {
-        for origin in origins {
-            if origin == self_pubkey {
-                continue;
-            }
-            if let Some(p) = self.active_set.get_mut(peer) {
-                p.add(origin)
+    pub fn process_prune_msg(&self, self_pubkey: &Pubkey, peer: &Pubkey, origins: &[Pubkey]) {
+        if let Some(filter) = self.active_set.get(peer) {
+            for origin in origins {
+                if origin != self_pubkey {
+                    filter.add(origin);
+                }
             }
         }
     }
@@ -345,7 +342,7 @@ impl CrdsGossipPush {
                         continue;
                     }
                     let size = cmp::max(CRDS_GOSSIP_DEFAULT_BLOOM_ITEMS, network_size);
-                    let mut bloom = Bloom::random(size, 0.1, 1024 * 8 * 4);
+                    let bloom: AtomicBloom<_> = Bloom::random(size, 0.1, 1024 * 8 * 4).into();
                     bloom.add(&item.id);
                     new_items.insert(item.id, bloom);
                 }
@@ -375,16 +372,15 @@ impl CrdsGossipPush {
         let mut rng = rand::thread_rng();
         let max_weight = u16::MAX as f32 - 1.0;
         let active_cutoff = now.saturating_sub(PUSH_ACTIVE_TIMEOUT_MS);
-        crds.table
-            .values()
+        crds.get_nodes()
             .filter_map(|value| {
-                let info = value.value.contact_info()?;
+                let info = value.value.contact_info().unwrap();
                 // Stop pushing to nodes which have not been active recently.
                 if value.local_timestamp < active_cutoff {
                     // In order to mitigate eclipse attack, for staked nodes
                     // continue retrying periodically.
                     let stake = stakes.get(&info.id).unwrap_or(&0);
-                    if *stake == 0 || rng.gen_ratio(7, 8) {
+                    if *stake == 0 || !rng.gen_ratio(1, 16) {
                         return None;
                     }
                 }
@@ -423,6 +419,21 @@ impl CrdsGossipPush {
             v.retain(|_, (_, t)| *t > min_time);
             !v.is_empty()
         });
+    }
+
+    // Only for tests and simulations.
+    pub(crate) fn mock_clone(&self) -> Self {
+        let mut active_set = IndexMap::<Pubkey, AtomicBloom<Pubkey>>::new();
+        for (k, v) in &self.active_set {
+            active_set.insert(*k, v.mock_clone());
+        }
+        Self {
+            active_set,
+            push_messages: self.push_messages.clone(),
+            received_cache: self.received_cache.clone(),
+            last_pushed_to: self.last_pushed_to.clone(),
+            ..*self
+        }
     }
 }
 

@@ -7,9 +7,10 @@ use crate::{
 use chrono::prelude::{DateTime, Utc};
 use log::*;
 use solana_sdk::{
-    account::{next_keyed_account, KeyedAccount},
     hash::hash,
     instruction::InstructionError,
+    keyed_account::{next_keyed_account, KeyedAccount},
+    process_instruction::InvokeContext,
     program_utils::limited_deserialize,
     pubkey::Pubkey,
 };
@@ -116,6 +117,7 @@ pub fn process_instruction(
     _program_id: &Pubkey,
     keyed_accounts: &[KeyedAccount],
     data: &[u8],
+    _invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
     let keyed_accounts_iter = &mut keyed_accounts.iter();
     let instruction = limited_deserialize(data)?;
@@ -139,9 +141,10 @@ pub fn process_instruction(
                 trace!("contract already exists");
                 return Err(InstructionError::AccountAlreadyInitialized);
             }
-            let mut budget_state = BudgetState::default();
-            budget_state.pending_budget = Some(*expr);
-            budget_state.initialized = true;
+            let budget_state = BudgetState {
+                pending_budget: Some(*expr),
+                initialized: true,
+            };
             budget_state.serialize(&mut contract_keyed_account.try_account_ref_mut()?.data)
         }
         BudgetInstruction::ApplyTimestamp(dt) => {
@@ -238,7 +241,7 @@ mod tests {
     fn create_bank(lamports: u64) -> (Bank, Keypair) {
         let (genesis_config, mint_keypair) = create_genesis_config(lamports);
         let mut bank = Bank::new(&genesis_config);
-        bank.add_builtin_program("budget_program", id(), process_instruction);
+        bank.add_builtin("budget_program", id(), process_instruction);
         (bank, mint_keypair)
     }
 

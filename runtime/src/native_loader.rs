@@ -1,5 +1,4 @@
 //! Native loader
-use crate::process_instruction::{InvokeContext, LoaderEntrypoint};
 #[cfg(unix)]
 use libloading::os::unix::*;
 #[cfg(windows)]
@@ -7,13 +6,21 @@ use libloading::os::windows::*;
 use log::*;
 use num_derive::{FromPrimitive, ToPrimitive};
 use solana_sdk::{
-    account::{next_keyed_account, KeyedAccount},
     decode_error::DecodeError,
     entrypoint_native::ProgramEntrypoint,
     instruction::InstructionError,
+    keyed_account::{next_keyed_account, KeyedAccount},
+    native_loader,
+    process_instruction::{InvokeContext, LoaderEntrypoint},
     pubkey::Pubkey,
 };
-use std::{collections::HashMap, env, path::PathBuf, str, sync::RwLock};
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path, PathBuf},
+    str,
+    sync::RwLock,
+};
 use thiserror::Error;
 
 #[derive(Error, Debug, Serialize, Clone, PartialEq, FromPrimitive, ToPrimitive)]
@@ -84,12 +91,12 @@ impl NativeLoader {
     }
 
     #[cfg(windows)]
-    fn library_open(path: &PathBuf) -> Result<Library, libloading::Error> {
+    fn library_open(path: &Path) -> Result<Library, libloading::Error> {
         Library::new(path)
     }
 
     #[cfg(not(windows))]
-    fn library_open(path: &PathBuf) -> Result<Library, libloading::Error> {
+    fn library_open(path: &Path) -> Result<Library, libloading::Error> {
         // Linux tls bug can cause crash on dlclose(), workaround by never unloading
         Library::open(Some(path), libc::RTLD_NODELETE | libc::RTLD_NOW)
     }
@@ -126,13 +133,22 @@ impl NativeLoader {
 
     pub fn process_instruction(
         &self,
-        _program_id: &Pubkey,
+        program_id: &Pubkey,
         keyed_accounts: &[KeyedAccount],
         instruction_data: &[u8],
         invoke_context: &dyn InvokeContext,
     ) -> Result<(), InstructionError> {
         let mut keyed_accounts_iter = keyed_accounts.iter();
         let program = next_keyed_account(&mut keyed_accounts_iter)?;
+        if native_loader::id() != *program_id {
+            error!("Program id mismatch");
+            return Err(InstructionError::IncorrectProgramId);
+        }
+        if program.owner()? != *program_id {
+            error!("Executable account now owned by loader");
+            return Err(InstructionError::IncorrectProgramId);
+        }
+
         let params = keyed_accounts_iter.as_slice();
         let name_vec = &program.try_account_ref()?.data;
         let name = match str::from_utf8(name_vec) {

@@ -1,3 +1,5 @@
+const math = require('remark-math');
+const katex = require('rehype-katex');
 module.exports = {
     title: "Solana Docs",
     tagline:
@@ -6,7 +8,17 @@ module.exports = {
     baseUrl: "/",
     favicon: "img/favicon.ico",
     organizationName: "solana-labs", // Usually your GitHub org/user name.
-    projectName: "solana", // Usually your repo name.
+	projectName: "solana", // Usually your repo name.
+	onBrokenLinks: 'throw',
+    stylesheets: [
+	{
+	    href: '/katex/katex.min.css',
+	    type: 'text/css',
+	    integrity:
+            'sha384-AfEj0r4/OFrOo5t7NnNe46zW/tFgW6x/bCJG8FqQCEo3+Aro6EYUG4+cU+KJWu/X',
+	    crossorigin: 'anonymous',
+	},
+    ],
     themeConfig: {
 	navbar: {
 	    logo: {
@@ -21,7 +33,7 @@ module.exports = {
 		    position: "left",
 		},
 		{
-		    to: "apps",
+		    to: "developing/programming-model/overview",
 		    label: "Develop",
 		    position: "left",
 		},
@@ -111,6 +123,8 @@ module.exports = {
 		    path: "src",
 		    routeBasePath: "/",
 		    sidebarPath: require.resolve("./sidebars.js"),
+		    remarkPlugins: [math],
+		    rehypePlugins: [katex],
 		},
 		theme: {
 		    customCss: require.resolve("./src/css/custom.css"),

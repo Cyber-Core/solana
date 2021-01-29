@@ -15,9 +15,7 @@ use solana_ledger::{
 };
 use solana_sdk::{
     client::SyncClient,
-    clock::{
-        self, Slot, DEFAULT_TICKS_PER_SECOND, DEFAULT_TICKS_PER_SLOT, NUM_CONSECUTIVE_LEADER_SLOTS,
-    },
+    clock::{self, Slot, DEFAULT_MS_PER_SLOT, NUM_CONSECUTIVE_LEADER_SLOTS},
     commitment_config::CommitmentConfig,
     epoch_schedule::MINIMUM_SLOTS_PER_EPOCH,
     hash::Hash,
@@ -35,8 +33,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DEFAULT_SLOT_MILLIS: u64 = (DEFAULT_TICKS_PER_SLOT * 1000) / DEFAULT_TICKS_PER_SECOND;
-
 /// Spend and verify from every node in the network
 pub fn spend_and_verify_all_nodes<S: ::std::hash::BuildHasher>(
     entry_point_info: &ContactInfo,
@@ -53,11 +49,14 @@ pub fn spend_and_verify_all_nodes<S: ::std::hash::BuildHasher>(
         let random_keypair = Keypair::new();
         let client = create_client(ingress_node.client_facing_addr(), VALIDATOR_PORT_RANGE);
         let bal = client
-            .poll_get_balance_with_commitment(&funding_keypair.pubkey(), CommitmentConfig::recent())
+            .poll_get_balance_with_commitment(
+                &funding_keypair.pubkey(),
+                CommitmentConfig::processed(),
+            )
             .expect("balance in source");
         assert!(bal > 0);
         let (blockhash, _fee_calculator, _last_valid_slot) = client
-            .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
+            .get_recent_blockhash_with_commitment(CommitmentConfig::processed())
             .unwrap();
         let mut transaction =
             system_transaction::transfer(&funding_keypair, &random_keypair.pubkey(), 1, blockhash);
@@ -82,7 +81,7 @@ pub fn verify_balances<S: ::std::hash::BuildHasher>(
     let client = create_client(node.client_facing_addr(), VALIDATOR_PORT_RANGE);
     for (pk, b) in expected_balances {
         let bal = client
-            .poll_get_balance_with_commitment(&pk, CommitmentConfig::recent())
+            .poll_get_balance_with_commitment(&pk, CommitmentConfig::processed())
             .expect("balance in source");
         assert_eq!(bal, b);
     }
@@ -99,11 +98,14 @@ pub fn send_many_transactions(
     for _ in 0..num_txs {
         let random_keypair = Keypair::new();
         let bal = client
-            .poll_get_balance_with_commitment(&funding_keypair.pubkey(), CommitmentConfig::recent())
+            .poll_get_balance_with_commitment(
+                &funding_keypair.pubkey(),
+                CommitmentConfig::processed(),
+            )
             .expect("balance in source");
         assert!(bal > 0);
         let (blockhash, _fee_calculator, _last_valid_slot) = client
-            .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
+            .get_recent_blockhash_with_commitment(CommitmentConfig::processed())
             .unwrap();
         let transfer_amount = thread_rng().gen_range(1, max_tokens_per_transfer);
 
@@ -131,7 +133,7 @@ pub fn validator_exit(entry_point_info: &ContactInfo, nodes: usize) {
         let client = create_client(node.client_facing_addr(), VALIDATOR_PORT_RANGE);
         assert!(client.validator_exit().unwrap());
     }
-    sleep(Duration::from_millis(DEFAULT_SLOT_MILLIS));
+    sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT));
     for node in &cluster_nodes {
         let client = create_client(node.client_facing_addr(), VALIDATOR_PORT_RANGE);
         assert!(client.validator_exit().is_err());
@@ -199,7 +201,7 @@ pub fn kill_entry_and_spend_and_verify_rest(
 
     for ingress_node in &cluster_nodes {
         client
-            .poll_get_balance_with_commitment(&ingress_node.id, CommitmentConfig::recent())
+            .poll_get_balance_with_commitment(&ingress_node.id, CommitmentConfig::processed())
             .unwrap_or_else(|err| panic!("Node {} has no balance: {}", ingress_node.id, err));
     }
 
@@ -223,7 +225,10 @@ pub fn kill_entry_and_spend_and_verify_rest(
 
         let client = create_client(ingress_node.client_facing_addr(), VALIDATOR_PORT_RANGE);
         let balance = client
-            .poll_get_balance_with_commitment(&funding_keypair.pubkey(), CommitmentConfig::recent())
+            .poll_get_balance_with_commitment(
+                &funding_keypair.pubkey(),
+                CommitmentConfig::processed(),
+            )
             .expect("balance in source");
         assert_ne!(balance, 0);
 
@@ -237,7 +242,7 @@ pub fn kill_entry_and_spend_and_verify_rest(
 
             let random_keypair = Keypair::new();
             let (blockhash, _fee_calculator, _last_valid_slot) = client
-                .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
+                .get_recent_blockhash_with_commitment(CommitmentConfig::processed())
                 .unwrap();
             let mut transaction = system_transaction::transfer(
                 &funding_keypair,
@@ -315,7 +320,7 @@ pub fn check_no_new_roots(
                 .unwrap_or_else(|_| panic!("get_slot for {} failed", ingress_node.id));
             roots[i] = initial_root;
             client
-                .get_slot_with_commitment(CommitmentConfig::recent())
+                .get_slot_with_commitment(CommitmentConfig::processed())
                 .unwrap_or_else(|_| panic!("get_slot for {} failed", ingress_node.id))
         })
         .max()
@@ -329,7 +334,7 @@ pub fn check_no_new_roots(
         for contact_info in contact_infos {
             let client = create_client(contact_info.client_facing_addr(), VALIDATOR_PORT_RANGE);
             current_slot = client
-                .get_slot_with_commitment(CommitmentConfig::recent())
+                .get_slot_with_commitment(CommitmentConfig::processed())
                 .unwrap_or_else(|_| panic!("get_slot for {} failed", contact_infos[0].id));
             if current_slot > end_slot {
                 reached_end_slot = true;

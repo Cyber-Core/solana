@@ -12,14 +12,12 @@ import {
   ParsedTransaction,
   TransactionInstruction,
   Transaction,
+  PartiallyDecodedInstruction,
+  ParsedInstruction,
 } from "@solana/web3.js";
 import { TokenRegistry } from "tokenRegistry";
 import { Cluster } from "providers/cluster";
 import { SerumMarketRegistry } from "serumMarketRegistry";
-
-export const EXTERNAL_PROGRAMS: { [key: string]: string } = {
-  Serum: "4ckmDgGdxQoPDLUkDT3vHgSAkzA3QRdNq5ywwY4sUSJn",
-};
 
 export type ProgramName = typeof PROGRAM_IDS[keyof typeof PROGRAM_IDS];
 
@@ -34,6 +32,10 @@ export const PROGRAM_IDS = {
   Vest111111111111111111111111111111111111111: "Vest Program",
   [VOTE_PROGRAM_ID.toBase58()]: "Vote Program",
   TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA: "SPL Token Program",
+  ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL:
+    "SPL Associated Token Account Program",
+  Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo: "Memo Program",
+  SwaPpA9LAaLfeLi3a68M4DjnLqgtticKg6CnyNwgAC8: "Token Swap Program",
 } as const;
 
 export type LoaderName = typeof LOADER_IDS[keyof typeof LOADER_IDS];
@@ -49,15 +51,15 @@ const SYSVAR_ID: { [key: string]: string } = {
 };
 
 export const SYSVAR_IDS = {
-  [SYSVAR_CLOCK_PUBKEY.toBase58()]: "SYSVAR_CLOCK",
-  SysvarEpochSchedu1e111111111111111111111111: "SYSVAR_EPOCH_SCHEDULE",
-  SysvarFees111111111111111111111111111111111: "SYSVAR_FEES",
-  SysvarRecentB1ockHashes11111111111111111111: "SYSVAR_RECENT_BLOCKHASHES",
-  [SYSVAR_RENT_PUBKEY.toBase58()]: "SYSVAR_RENT",
-  [SYSVAR_REWARDS_PUBKEY.toBase58()]: "SYSVAR_REWARDS",
-  SysvarS1otHashes111111111111111111111111111: "SYSVAR_SLOT_HASHES",
-  SysvarS1otHistory11111111111111111111111111: "SYSVAR_SLOT_HISTORY",
-  [SYSVAR_STAKE_HISTORY_PUBKEY.toBase58()]: "SYSVAR_STAKE_HISTORY",
+  [SYSVAR_CLOCK_PUBKEY.toBase58()]: "Sysvar: Clock",
+  SysvarEpochSchedu1e111111111111111111111111: "Sysvar: Epoch Schedule",
+  SysvarFees111111111111111111111111111111111: "Sysvar: Fees",
+  SysvarRecentB1ockHashes11111111111111111111: "Sysvar: Recent Blockhashes",
+  [SYSVAR_RENT_PUBKEY.toBase58()]: "Sysvar: Rent",
+  [SYSVAR_REWARDS_PUBKEY.toBase58()]: "Sysvar: Rewards",
+  SysvarS1otHashes111111111111111111111111111: "Sysvar: Slot Hashes",
+  SysvarS1otHistory11111111111111111111111111: "Sysvar: Slot History",
+  [SYSVAR_STAKE_HISTORY_PUBKEY.toBase58()]: "Sysvar: Stake History",
 };
 
 export function addressLabel(
@@ -80,10 +82,9 @@ export function displayAddress(address: string, cluster: Cluster): string {
 
 export function intoTransactionInstruction(
   tx: ParsedTransaction,
-  index: number
+  instruction: ParsedInstruction | PartiallyDecodedInstruction
 ): TransactionInstruction | undefined {
   const message = tx.message;
-  const instruction = message.instructions[index];
   if ("parsed" in instruction) return;
 
   const keys = [];
@@ -126,36 +127,4 @@ export function intoParsedTransaction(tx: Transaction): ParsedTransaction {
       recentBlockhash: message.recentBlockhash,
     },
   };
-}
-
-export function isSerumInstruction(instruction: TransactionInstruction) {
-  return instruction.programId.toBase58() === EXTERNAL_PROGRAMS["Serum"];
-}
-
-const SERUM_CODE_LOOKUP: { [key: number]: string } = {
-  0: "Initialize Market",
-  1: "New Order",
-  2: "Match Order",
-  3: "Consume Events",
-  4: "Cancel Order",
-  5: "Settle Funds",
-  6: "Cancel Order By Client Id",
-  7: "Disable Market",
-  8: "Sweep Fees",
-};
-
-export function parseSerumInstructionTitle(
-  instruction: TransactionInstruction
-): string {
-  try {
-    const code = instruction.data.slice(1, 5).readUInt32LE(0);
-
-    if (!(code in SERUM_CODE_LOOKUP)) {
-      throw new Error(`Unrecognized Serum instruction code: ${code}`);
-    }
-
-    return SERUM_CODE_LOOKUP[code];
-  } catch (error) {
-    throw error;
-  }
 }

@@ -6,8 +6,13 @@ use jsonrpc_derive::rpc;
 use jsonrpc_pubsub::{typed::Subscriber, Session, SubscriptionId};
 use solana_account_decoder::UiAccount;
 use solana_client::{
-    rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSignatureSubscribeConfig},
-    rpc_response::{Response as RpcResponse, RpcKeyedAccount, RpcSignatureResult, SlotInfo},
+    rpc_config::{
+        RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSignatureSubscribeConfig,
+        RpcTransactionLogsConfig, RpcTransactionLogsFilter,
+    },
+    rpc_response::{
+        Response as RpcResponse, RpcKeyedAccount, RpcLogsResponse, RpcSignatureResult, SlotInfo,
+    },
 };
 #[cfg(test)]
 use solana_runtime::bank_forks::BankForks;
@@ -18,6 +23,8 @@ use std::{
     str::FromStr,
     sync::{atomic, Arc},
 };
+
+const MAX_ACTIVE_SUBSCRIPTIONS: usize = 100_000;
 
 // Suppress needless_return due to
 //   https://github.com/paritytech/jsonrpc/blob/2d38e6424d8461cdf72e78425ce67d51af9c6586/derive/src/lib.rs#L204
@@ -74,6 +81,24 @@ pub trait RpcSolPubSub {
     )]
     fn program_unsubscribe(&self, meta: Option<Self::Metadata>, id: SubscriptionId)
         -> Result<bool>;
+
+    // Get logs for all transactions that reference the specified address
+    #[pubsub(subscription = "logsNotification", subscribe, name = "logsSubscribe")]
+    fn logs_subscribe(
+        &self,
+        meta: Self::Metadata,
+        subscriber: Subscriber<RpcResponse<RpcLogsResponse>>,
+        filter: RpcTransactionLogsFilter,
+        config: Option<RpcTransactionLogsConfig>,
+    );
+
+    // Unsubscribe from logs notification subscription.
+    #[pubsub(
+        subscription = "logsNotification",
+        unsubscribe,
+        name = "logsUnsubscribe"
+    )]
+    fn logs_unsubscribe(&self, meta: Option<Self::Metadata>, id: SubscriptionId) -> Result<bool>;
 
     // Get notification when signature is verified
     // Accepts signature parameter as base-58 encoded string
@@ -156,6 +181,22 @@ impl RpcSolPubSubImpl {
         let subscriptions = Arc::new(RpcSubscriptions::default_with_bank_forks(bank_forks));
         Self { uid, subscriptions }
     }
+
+    fn check_subscription_count(&self) -> Result<()> {
+        let num_subscriptions = self.subscriptions.total();
+        debug!("Total existing subscriptions: {}", num_subscriptions);
+        if num_subscriptions >= MAX_ACTIVE_SUBSCRIPTIONS {
+            info!("Node subscription limit reached");
+            Err(Error {
+                code: ErrorCode::InternalError,
+                message: "Internal Error: Subscription refused. Node subscription limit reached"
+                    .into(),
+                data: None,
+            })
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn param<T: FromStr>(param_str: &str, thing: &str) -> Result<T> {
@@ -176,6 +217,10 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
         pubkey_str: String,
         config: Option<RpcAccountInfoConfig>,
     ) {
+        if let Err(err) = self.check_subscription_count() {
+            subscriber.reject(err).unwrap_or_default();
+            return;
+        }
         match param::<Pubkey>(&pubkey_str, "pubkey") {
             Ok(pubkey) => {
                 let id = self.uid.fetch_add(1, atomic::Ordering::Relaxed);
@@ -184,7 +229,7 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
                 self.subscriptions
                     .add_account_subscription(pubkey, config, sub_id, subscriber)
             }
-            Err(e) => subscriber.reject(e).unwrap(),
+            Err(e) => subscriber.reject(e).unwrap_or_default(),
         }
     }
 
@@ -212,6 +257,10 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
         pubkey_str: String,
         config: Option<RpcProgramAccountsConfig>,
     ) {
+        if let Err(err) = self.check_subscription_count() {
+            subscriber.reject(err).unwrap_or_default();
+            return;
+        }
         match param::<Pubkey>(&pubkey_str, "pubkey") {
             Ok(pubkey) => {
                 let id = self.uid.fetch_add(1, atomic::Ordering::Relaxed);
@@ -220,7 +269,7 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
                 self.subscriptions
                     .add_program_subscription(pubkey, config, sub_id, subscriber)
             }
-            Err(e) => subscriber.reject(e).unwrap(),
+            Err(e) => subscriber.reject(e).unwrap_or_default(),
         }
     }
 
@@ -241,6 +290,71 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
         }
     }
 
+    fn logs_subscribe(
+        &self,
+        _meta: Self::Metadata,
+        subscriber: Subscriber<RpcResponse<RpcLogsResponse>>,
+        filter: RpcTransactionLogsFilter,
+        config: Option<RpcTransactionLogsConfig>,
+    ) {
+        info!("logs_subscribe");
+        if let Err(err) = self.check_subscription_count() {
+            subscriber.reject(err).unwrap_or_default();
+            return;
+        }
+
+        let (address, include_votes) = match filter {
+            RpcTransactionLogsFilter::All => (None, false),
+            RpcTransactionLogsFilter::AllWithVotes => (None, true),
+            RpcTransactionLogsFilter::Mentions(addresses) => {
+                match addresses.len() {
+                    1 => match param::<Pubkey>(&addresses[0], "mentions") {
+                        Ok(address) => (Some(address), false),
+                        Err(e) => {
+                            subscriber.reject(e).unwrap_or_default();
+                            return;
+                        }
+                    },
+                    _ => {
+                        // Room is reserved in the API to support multiple addresses, but for now
+                        // the implementation only supports one
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::InvalidParams,
+                                message: "Invalid Request: Only 1 address supported".into(),
+                                data: None,
+                            })
+                            .unwrap_or_default();
+                        return;
+                    }
+                }
+            }
+        };
+
+        let id = self.uid.fetch_add(1, atomic::Ordering::Relaxed);
+        let sub_id = SubscriptionId::Number(id as u64);
+        self.subscriptions.add_logs_subscription(
+            address,
+            include_votes,
+            config.and_then(|config| config.commitment),
+            sub_id,
+            subscriber,
+        )
+    }
+
+    fn logs_unsubscribe(&self, _meta: Option<Self::Metadata>, id: SubscriptionId) -> Result<bool> {
+        info!("logs_unsubscribe: id={:?}", id);
+        if self.subscriptions.remove_logs_subscription(&id) {
+            Ok(true)
+        } else {
+            Err(Error {
+                code: ErrorCode::InvalidParams,
+                message: "Invalid Request: Subscription id does not exist".into(),
+                data: None,
+            })
+        }
+    }
+
     fn signature_subscribe(
         &self,
         _meta: Self::Metadata,
@@ -249,6 +363,10 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
         signature_subscribe_config: Option<RpcSignatureSubscribeConfig>,
     ) {
         info!("signature_subscribe");
+        if let Err(err) = self.check_subscription_count() {
+            subscriber.reject(err).unwrap_or_default();
+            return;
+        }
         match param::<Signature>(&signature_str, "signature") {
             Ok(signature) => {
                 let id = self.uid.fetch_add(1, atomic::Ordering::Relaxed);
@@ -264,7 +382,7 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
                     subscriber,
                 );
             }
-            Err(e) => subscriber.reject(e).unwrap(),
+            Err(e) => subscriber.reject(e).unwrap_or_default(),
         }
     }
 
@@ -287,6 +405,10 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
 
     fn slot_subscribe(&self, _meta: Self::Metadata, subscriber: Subscriber<SlotInfo>) {
         info!("slot_subscribe");
+        if let Err(err) = self.check_subscription_count() {
+            subscriber.reject(err).unwrap_or_default();
+            return;
+        }
         let id = self.uid.fetch_add(1, atomic::Ordering::Relaxed);
         let sub_id = SubscriptionId::Number(id as u64);
         info!("slot_subscribe: id={:?}", sub_id);
@@ -308,6 +430,10 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
 
     fn vote_subscribe(&self, _meta: Self::Metadata, subscriber: Subscriber<RpcVote>) {
         info!("vote_subscribe");
+        if let Err(err) = self.check_subscription_count() {
+            subscriber.reject(err).unwrap_or_default();
+            return;
+        }
         let id = self.uid.fetch_add(1, atomic::Ordering::Relaxed);
         let sub_id = SubscriptionId::Number(id as u64);
         info!("vote_subscribe: id={:?}", sub_id);
@@ -329,6 +455,10 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
 
     fn root_subscribe(&self, _meta: Self::Metadata, subscriber: Subscriber<Slot>) {
         info!("root_subscribe");
+        if let Err(err) = self.check_subscription_count() {
+            subscriber.reject(err).unwrap_or_default();
+            return;
+        }
         let id = self.uid.fetch_add(1, atomic::Ordering::Relaxed);
         let sub_id = SubscriptionId::Number(id as u64);
         info!("root_subscribe: id={:?}", sub_id);
@@ -360,7 +490,7 @@ mod tests {
     use crossbeam_channel::unbounded;
     use jsonrpc_core::{futures::sync::mpsc, Response};
     use jsonrpc_pubsub::{PubSubHandler, Session};
-    use serial_test_derive::serial;
+    use serial_test::serial;
     use solana_account_decoder::{parse_account_data::parse_account_data, UiAccountEncoding};
     use solana_client::rpc_response::{ProcessedSignatureResult, ReceivedSignatureResult};
     use solana_runtime::{
@@ -404,8 +534,10 @@ mod tests {
             .get(current_slot)
             .unwrap()
             .process_transaction(tx)?;
-        let mut commitment_slots = CommitmentSlots::default();
-        commitment_slots.slot = current_slot;
+        let commitment_slots = CommitmentSlots {
+            slot: current_slot,
+            ..CommitmentSlots::default()
+        };
         subscriptions.notify_subscribers(commitment_slots);
         Ok(())
     }
@@ -442,7 +574,15 @@ mod tests {
 
         let session = create_session();
         let (subscriber, _id_receiver, receiver) = Subscriber::new_test("signatureNotification");
-        rpc.signature_subscribe(session, subscriber, tx.signatures[0].to_string(), None);
+        rpc.signature_subscribe(
+            session,
+            subscriber,
+            tx.signatures[0].to_string(),
+            Some(RpcSignatureSubscribeConfig {
+                commitment: Some(CommitmentConfig::finalized()),
+                ..RpcSignatureSubscribeConfig::default()
+            }),
+        );
 
         process_transaction_and_notify(&bank_forks, &tx, &rpc.subscriptions, 0).unwrap();
 
@@ -472,7 +612,7 @@ mod tests {
             subscriber,
             tx.signatures[0].to_string(),
             Some(RpcSignatureSubscribeConfig {
-                commitment: None,
+                commitment: Some(CommitmentConfig::finalized()),
                 enable_received_notification: Some(true),
             }),
         );
@@ -581,7 +721,7 @@ mod tests {
             subscriber,
             stake_account.pubkey().to_string(),
             Some(RpcAccountInfoConfig {
-                commitment: Some(CommitmentConfig::recent()),
+                commitment: Some(CommitmentConfig::processed()),
                 encoding: None,
                 data_slice: None,
             }),
@@ -641,6 +781,7 @@ mod tests {
             &stake_authority.pubkey(),
             &new_stake_authority,
             StakeAuthorize::Staker,
+            None,
         );
         let message = Message::new(&[ix], Some(&stake_authority.pubkey()));
         let tx = Transaction::new(&[&stake_authority], message, blockhash);
@@ -690,7 +831,7 @@ mod tests {
             subscriber,
             nonce_account.pubkey().to_string(),
             Some(RpcAccountInfoConfig {
-                commitment: Some(CommitmentConfig::recent()),
+                commitment: Some(CommitmentConfig::processed()),
                 encoding: Some(UiAccountEncoding::JsonParsed),
                 data_slice: None,
             }),
@@ -812,7 +953,7 @@ mod tests {
             subscriber,
             bob.pubkey().to_string(),
             Some(RpcAccountInfoConfig {
-                commitment: Some(CommitmentConfig::root()),
+                commitment: Some(CommitmentConfig::finalized()),
                 encoding: None,
                 data_slice: None,
             }),
@@ -866,7 +1007,7 @@ mod tests {
             subscriber,
             bob.pubkey().to_string(),
             Some(RpcAccountInfoConfig {
-                commitment: Some(CommitmentConfig::root()),
+                commitment: Some(CommitmentConfig::finalized()),
                 encoding: None,
                 data_slice: None,
             }),
@@ -880,8 +1021,10 @@ mod tests {
             .unwrap()
             .process_transaction(&tx)
             .unwrap();
-        let mut commitment_slots = CommitmentSlots::default();
-        commitment_slots.slot = 1;
+        let commitment_slots = CommitmentSlots {
+            slot: 1,
+            ..CommitmentSlots::default()
+        };
         rpc.subscriptions.notify_subscribers(commitment_slots);
 
         let commitment_slots = CommitmentSlots {
@@ -1002,11 +1145,12 @@ mod tests {
         // Setup Subscriptions
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let subscriptions = RpcSubscriptions::new(
+        let subscriptions = RpcSubscriptions::new_with_vote_subscription(
             &exit,
             bank_forks,
             block_commitment_cache,
             optimistically_confirmed_bank,
+            true,
         );
         rpc.subscriptions = Arc::new(subscriptions);
         rpc.vote_subscribe(session, subscriber);

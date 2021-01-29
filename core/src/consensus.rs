@@ -5,9 +5,11 @@ use crate::{
 use chrono::prelude::*;
 use solana_ledger::{ancestor_iterator::AncestorIterator, blockstore::Blockstore, blockstore_db};
 use solana_measure::measure::Measure;
-use solana_runtime::{bank::Bank, bank_forks::BankForks, commitment::VOTE_THRESHOLD_SIZE};
+use solana_runtime::{
+    bank::Bank, bank_forks::BankForks, commitment::VOTE_THRESHOLD_SIZE,
+    vote_account::ArcVoteAccount,
+};
 use solana_sdk::{
-    account::Account,
     clock::{Slot, UnixTimestamp},
     hash::Hash,
     instruction::Instruction,
@@ -24,7 +26,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::BufReader,
-    ops::Bound::{Included, Unbounded},
+    ops::{
+        Bound::{Included, Unbounded},
+        Deref,
+    },
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -89,7 +94,7 @@ pub(crate) struct ComputedBankState {
     pub pubkey_votes: Arc<PubkeyVotes>,
 }
 
-#[frozen_abi(digest = "2ZUeCLMVQxmHYbeqMH7M97ifVSKoVErGvRHzyxcQRjgU")]
+#[frozen_abi(digest = "Eay84NBbJqiMBfE7HHH2o6e51wcvoU79g8zCi5sw6uj3")]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, AbiExample)]
 pub struct Tower {
     node_pubkey: Pubkey,
@@ -179,23 +184,21 @@ impl Tower {
         vote_account: &Pubkey,
     ) -> Self {
         let root_bank = bank_forks.root_bank();
-        let (_progress, heaviest_subtree_fork_choice, unlock_heaviest_subtree_fork_choice_slot) =
+        let (_progress, heaviest_subtree_fork_choice) =
             crate::replay_stage::ReplayStage::initialize_progress_and_fork_choice(
-                root_bank,
+                root_bank.deref(),
                 bank_forks.frozen_banks().values().cloned().collect(),
                 &my_pubkey,
                 &vote_account,
             );
         let root = root_bank.slot();
 
-        let heaviest_bank = if root > unlock_heaviest_subtree_fork_choice_slot {
-            bank_forks
-                .get(heaviest_subtree_fork_choice.best_overall_slot())
-                .expect("The best overall slot must be one of `frozen_banks` which all exist in bank_forks")
-                .clone()
-        } else {
-            Tower::find_heaviest_bank(&bank_forks, &my_pubkey).unwrap_or_else(|| root_bank.clone())
-        };
+        let heaviest_bank = bank_forks
+            .get(heaviest_subtree_fork_choice.best_overall_slot())
+            .expect(
+                "The best overall slot must be one of `frozen_banks` which all exist in bank_forks",
+            )
+            .clone();
 
         Self::new(
             &my_pubkey,
@@ -214,8 +217,9 @@ impl Tower {
         all_pubkeys: &mut PubkeyReferences,
     ) -> ComputedBankState
     where
-        F: Iterator<Item = (Pubkey, (u64, Account))>,
+        F: IntoIterator<Item = (Pubkey, (u64, ArcVoteAccount))>,
     {
+        let mut vote_slots = HashSet::new();
         let mut voted_stakes = HashMap::new();
         let mut total_stake = 0;
         let mut bank_weight = 0;
@@ -228,20 +232,20 @@ impl Tower {
                 continue;
             }
             trace!("{} {} with stake {}", node_pubkey, key, voted_stake);
-            let vote_state = VoteState::from(&account);
-            if vote_state.is_none() {
-                datapoint_warn!(
-                    "tower_warn",
-                    (
-                        "warn",
-                        format!("Unable to get vote_state from account {}", key),
-                        String
-                    ),
-                );
-                continue;
-            }
-            let mut vote_state = vote_state.unwrap();
-
+            let mut vote_state = match account.vote_state().as_ref() {
+                Err(_) => {
+                    datapoint_warn!(
+                        "tower_warn",
+                        (
+                            "warn",
+                            format!("Unable to get vote_state from account {}", key),
+                            String
+                        ),
+                    );
+                    continue;
+                }
+                Ok(vote_state) => vote_state.clone(),
+            };
             for vote in &vote_state.votes {
                 let key = all_pubkeys.get_or_insert(&key);
                 lockout_intervals
@@ -278,7 +282,7 @@ impl Tower {
 
             for vote in &vote_state.votes {
                 bank_weight += vote.lockout() as u128 * voted_stake as u128;
-                Self::populate_ancestor_voted_stakes(&mut voted_stakes, &vote, ancestors);
+                vote_slots.insert(vote.slot);
             }
 
             if start_root != vote_state.root_slot {
@@ -289,7 +293,7 @@ impl Tower {
                     };
                     trace!("ROOT: {}", vote.slot);
                     bank_weight += vote.lockout() as u128 * voted_stake as u128;
-                    Self::populate_ancestor_voted_stakes(&mut voted_stakes, &vote, ancestors);
+                    vote_slots.insert(vote.slot);
                 }
             }
             if let Some(root) = vote_state.root_slot {
@@ -298,7 +302,7 @@ impl Tower {
                     slot: root,
                 };
                 bank_weight += vote.lockout() as u128 * voted_stake as u128;
-                Self::populate_ancestor_voted_stakes(&mut voted_stakes, &vote, ancestors);
+                vote_slots.insert(vote.slot);
             }
 
             // The last vote in the vote stack is a simulated vote on bank_slot, which
@@ -326,6 +330,9 @@ impl Tower {
             total_stake += voted_stake;
         }
 
+        // TODO: populate_ancestor_voted_stakes only adds zeros. Comment why
+        // that is necessary (if so).
+        Self::populate_ancestor_voted_stakes(&mut voted_stakes, vote_slots, ancestors);
         ComputedBankState {
             voted_stakes,
             total_stake,
@@ -352,7 +359,7 @@ impl Tower {
         slot: Slot,
         hash: Hash,
         last_voted_slot_in_bank: Option<Slot>,
-    ) -> (Vote, usize) {
+    ) -> (Vote, Vec<Slot> /*VoteState.tower*/) {
         let mut local_vote_state = local_vote_state.clone();
         let vote = Vote::new(vec![slot], hash);
         local_vote_state.process_vote_unchecked(&vote);
@@ -372,16 +379,20 @@ impl Tower {
             slots,
             local_vote_state.votes
         );
-        (Vote::new(slots, hash), local_vote_state.votes.len() - 1)
+        (Vote::new(slots, hash), local_vote_state.tower())
     }
 
     fn last_voted_slot_in_bank(bank: &Bank, vote_account_pubkey: &Pubkey) -> Option<Slot> {
-        let vote_account = bank.vote_accounts().get(vote_account_pubkey)?.1.clone();
-        let bank_vote_state = VoteState::deserialize(&vote_account.data).ok()?;
-        bank_vote_state.last_voted_slot()
+        let (_stake, vote_account) = bank.get_vote_account(vote_account_pubkey)?;
+        let slot = vote_account.vote_state().as_ref().ok()?.last_voted_slot();
+        slot
     }
 
-    pub fn new_vote_from_bank(&self, bank: &Bank, vote_account_pubkey: &Pubkey) -> (Vote, usize) {
+    pub fn new_vote_from_bank(
+        &self,
+        bank: &Bank,
+        vote_account_pubkey: &Pubkey,
+    ) -> (Vote, Vec<Slot> /*VoteState.tower*/) {
         let voted_slot = Self::last_voted_slot_in_bank(bank, vote_account_pubkey);
         Self::new_vote(&self.lockouts, bank.slot(), bank.hash(), voted_slot)
     }
@@ -509,12 +520,65 @@ impl Tower {
         descendants: &HashMap<Slot, HashSet<u64>>,
         progress: &ProgressMap,
         total_stake: u64,
-        epoch_vote_accounts: &HashMap<Pubkey, (u64, Account)>,
+        epoch_vote_accounts: &HashMap<Pubkey, (u64, ArcVoteAccount)>,
     ) -> SwitchForkDecision {
         self.last_voted_slot()
             .map(|last_voted_slot| {
                 let root = self.root();
                 let empty_ancestors = HashSet::default();
+                let empty_ancestors_due_to_minor_unsynced_ledger = || {
+                    // This condition (stale stray last vote) shouldn't occur under normal validator
+                    // operation, indicating something unusual happened.
+                    // This condition could be introduced by manual ledger mishandling,
+                    // validator SEGV, OS/HW crash, or plain No Free Space FS error.
+
+                    // However, returning empty ancestors as a fallback here shouldn't result in
+                    // slashing by itself (Note that we couldn't fully preclude any kind of slashing if
+                    // the failure was OS or HW level).
+
+                    // Firstly, lockout is ensured elsewhere.
+
+                    // Also, there is no risk of optimistic conf. violation. Although empty ancestors
+                    // could result in incorrect (= more than actual) locked_out_stake and
+                    // false-positive SwitchProof later in this function, there should be no such a
+                    // heavier fork candidate, first of all, if the last vote (or any of its
+                    // unavailable ancestors) were already optimistically confirmed.
+                    // The only exception is that other validator is already violating it...
+                    if self.is_first_switch_check() && switch_slot < last_voted_slot {
+                        // `switch < last` is needed not to warn! this message just because of using
+                        // newer snapshots on validator restart
+                        let message = format!(
+                          "bank_forks doesn't have corresponding data for the stray restored \
+                           last vote({}), meaning some inconsistency between saved tower and ledger.",
+                          last_voted_slot
+                        );
+                        warn!("{}", message);
+                        datapoint_warn!("tower_warn", ("warn", message, String));
+                    }
+                    &empty_ancestors
+                };
+
+                let suspended_decision_due_to_major_unsynced_ledger = || {
+                    // This peculiar corner handling is needed mainly for a tower which is newer than
+                    // blockstore. (Yeah, we tolerate it for ease of maintaining validator by operators)
+                    // This condition could be introduced by manual ledger mishandling,
+                    // validator SEGV, OS/HW crash, or plain No Free Space FS error.
+
+                    // When we're in this clause, it basically means validator is badly running
+                    // with a future tower while replaying past slots, especially problematic is
+                    // last_voted_slot.
+                    // So, don't re-vote on it by returning pseudo FailedSwitchThreshold, otherwise
+                    // there would be slashing because of double vote on one of last_vote_ancestors.
+                    // (Well, needless to say, re-creating the duplicate block must be handled properly
+                    // at the banking stage: https://github.com/solana-labs/solana/issues/8232)
+                    //
+                    // To be specific, the replay stage is tricked into a false perception where
+                    // last_vote_ancestors is AVAILABLE for descendant-of-`switch_slot`,  stale, and
+                    // stray slots (which should always be empty_ancestors).
+                    //
+                    // This is covered by test_future_tower_* in local_cluster
+                    SwitchForkDecision::FailedSwitchThreshold(0, total_stake)
+                };
 
                 let last_vote_ancestors =
                     ancestors.get(&last_voted_slot).unwrap_or_else(|| {
@@ -529,35 +593,7 @@ impl Tower {
                             // all of them.
                             panic!("no ancestors found with slot: {}", last_voted_slot);
                         } else {
-                            // This condition (stale stray last vote) shouldn't occur under normal validator
-                            // operation, indicating something unusual happened.
-                            // Possible causes include: OS/HW crash, validator process crash, only saved tower
-                            // is moved over to a new setup, etc...
-
-                            // However, returning empty ancestors as a fallback here shouldn't result in
-                            // slashing by itself (Note that we couldn't fully preclude any kind of slashing if
-                            // the failure was OS or HW level).
-
-                            // Firstly, lockout is ensured elsewhere.
-
-                            // Also, there is no risk of optimistic conf. violation. Although empty ancestors
-                            // could result in incorrect (= more than actual) locked_out_stake and
-                            // false-positive SwitchProof later in this function, there should be no such a
-                            // heavier fork candidate, first of all, if the last vote (or any of its
-                            // unavailable ancestors) were already optimistically confirmed.
-                            // The only exception is that other validator is already violating it...
-                            if self.is_first_switch_check() && switch_slot < last_voted_slot {
-                                // `switch < last` is needed not to warn! this message just because of using
-                                // newer snapshots on validator restart
-                                let message = format!(
-                                  "bank_forks doesn't have corresponding data for the stray restored \
-                                   last vote({}), meaning some inconsistency between saved tower and ledger.",
-                                  last_voted_slot
-                                );
-                                warn!("{}", message);
-                                datapoint_warn!("tower_warn", ("warn", message, String));
-                            }
-                            &empty_ancestors
+                            empty_ancestors_due_to_minor_unsynced_ledger()
                         }
                     });
 
@@ -569,13 +605,18 @@ impl Tower {
                     return SwitchForkDecision::SameFork;
                 }
 
-                assert!(
-                    !last_vote_ancestors.contains(&switch_slot),
-                    "Should never consider switching to slot ({}), which is ancestors({:?}) of last vote: {}",
-                    switch_slot,
-                    last_vote_ancestors,
-                    last_voted_slot
-                );
+                if last_vote_ancestors.contains(&switch_slot) {
+                    if !self.is_stray_last_vote() {
+                        panic!(
+                            "Should never consider switching to slot ({}), which is ancestors({:?}) of last vote: {}",
+                            switch_slot,
+                            last_vote_ancestors,
+                            last_voted_slot
+                        );
+                    } else {
+                        return suspended_decision_due_to_major_unsynced_ledger();
+                    }
+                }
 
                 // By this point, we know the `switch_slot` is on a different fork
                 // (is neither an ancestor nor descendant of `last_vote`), so a
@@ -673,7 +714,7 @@ impl Tower {
         descendants: &HashMap<Slot, HashSet<u64>>,
         progress: &ProgressMap,
         total_stake: u64,
-        epoch_vote_accounts: &HashMap<Pubkey, (u64, Account)>,
+        epoch_vote_accounts: &HashMap<Pubkey, (u64, ArcVoteAccount)>,
     ) -> SwitchForkDecision {
         let decision = self.make_check_switch_threshold_decision(
             switch_slot,
@@ -736,41 +777,20 @@ impl Tower {
     /// Update lockouts for all the ancestors
     pub(crate) fn populate_ancestor_voted_stakes(
         voted_stakes: &mut VotedStakes,
-        vote: &Lockout,
+        vote_slots: impl IntoIterator<Item = Slot>,
         ancestors: &HashMap<Slot, HashSet<Slot>>,
     ) {
         // If there's no ancestors, that means this slot must be from before the current root,
         // in which case the lockouts won't be calculated in bank_weight anyways, so ignore
         // this slot
-        let vote_slot_ancestors = ancestors.get(&vote.slot);
-        if vote_slot_ancestors.is_none() {
-            return;
+        for vote_slot in vote_slots {
+            if let Some(slot_ancestors) = ancestors.get(&vote_slot) {
+                voted_stakes.entry(vote_slot).or_default();
+                for slot in slot_ancestors {
+                    voted_stakes.entry(*slot).or_default();
+                }
+            }
         }
-        let mut slot_with_ancestors = vec![vote.slot];
-        slot_with_ancestors.extend(vote_slot_ancestors.unwrap());
-        for slot in slot_with_ancestors {
-            voted_stakes.entry(slot).or_default();
-        }
-    }
-
-    pub(crate) fn find_heaviest_bank(
-        bank_forks: &BankForks,
-        node_pubkey: &Pubkey,
-    ) -> Option<Arc<Bank>> {
-        let ancestors = bank_forks.ancestors();
-        let mut bank_weights: Vec<_> = bank_forks
-            .frozen_banks()
-            .values()
-            .map(|b| {
-                (
-                    Self::bank_weight(node_pubkey, b, &ancestors),
-                    b.parents().len(),
-                    b.clone(),
-                )
-            })
-            .collect();
-        bank_weights.sort_by_key(|b| (b.0, b.1));
-        bank_weights.pop().map(|b| b.2)
     }
 
     /// Update stake for all the ancestors.
@@ -783,31 +803,12 @@ impl Tower {
     ) {
         // If there's no ancestors, that means this slot must be from
         // before the current root, so ignore this slot
-        let vote_slot_ancestors = ancestors.get(&voted_slot);
-        if vote_slot_ancestors.is_none() {
-            return;
+        if let Some(vote_slot_ancestors) = ancestors.get(&voted_slot) {
+            *voted_stakes.entry(voted_slot).or_default() += voted_stake;
+            for slot in vote_slot_ancestors {
+                *voted_stakes.entry(*slot).or_default() += voted_stake;
+            }
         }
-        let mut slot_with_ancestors = vec![voted_slot];
-        slot_with_ancestors.extend(vote_slot_ancestors.unwrap());
-        for slot in slot_with_ancestors {
-            let current = voted_stakes.entry(slot).or_default();
-            *current += voted_stake;
-        }
-    }
-
-    fn bank_weight(
-        node_pubkey: &Pubkey,
-        bank: &Bank,
-        ancestors: &HashMap<Slot, HashSet<Slot>>,
-    ) -> u128 {
-        let ComputedBankState { bank_weight, .. } = Self::collect_vote_lockouts(
-            node_pubkey,
-            bank.slot(),
-            bank.vote_accounts().into_iter(),
-            ancestors,
-            &mut PubkeyReferences::default(),
-        );
-        bank_weight
     }
 
     fn voted_slots(&self) -> Vec<Slot> {
@@ -846,14 +847,6 @@ impl Tower {
         );
         assert_eq!(slot_history.check(replayed_root), Check::Found);
 
-        // reconcile_blockstore_roots_with_tower() should already have aligned these.
-        assert!(
-            tower_root <= replayed_root,
-            format!(
-                "tower root: {:?} >= replayed root slot: {}",
-                tower_root, replayed_root
-            )
-        );
         assert!(
             self.last_vote == Vote::default() && self.lockouts.votes.is_empty()
                 || self.last_vote != Vote::default() && !self.lockouts.votes.is_empty(),
@@ -864,16 +857,59 @@ impl Tower {
         );
 
         if let Some(last_voted_slot) = self.last_voted_slot() {
-            if slot_history.check(last_voted_slot) == Check::TooOld {
-                // We could try hard to anchor with other older votes, but opt to simplify the
-                // following logic
-                return Err(TowerError::TooOldTower(
+            if tower_root <= replayed_root {
+                // Normally, we goes into this clause with possible help of
+                // reconcile_blockstore_roots_with_tower()
+                if slot_history.check(last_voted_slot) == Check::TooOld {
+                    // We could try hard to anchor with other older votes, but opt to simplify the
+                    // following logic
+                    return Err(TowerError::TooOldTower(
+                        last_voted_slot,
+                        slot_history.oldest(),
+                    ));
+                }
+
+                self.adjust_lockouts_with_slot_history(slot_history)?;
+                self.initialize_root(replayed_root);
+            } else {
+                // This should never occur under normal operation.
+                // While this validator's voting is suspended this way,
+                // suspended_decision_due_to_major_unsynced_ledger() will be also touched.
+                let message = format!(
+                    "For some reason, we're REPROCESSING slots which has already been \
+                     voted and ROOTED by us; \
+                     VOTING will be SUSPENDED UNTIL {}!",
                     last_voted_slot,
-                    slot_history.oldest(),
-                ));
+                );
+                error!("{}", message);
+                datapoint_error!("tower_error", ("error", message, String));
+
+                // Let's pass-through adjust_lockouts_with_slot_history just for sanitization,
+                // using a synthesized SlotHistory.
+
+                let mut warped_slot_history = (*slot_history).clone();
+                // Blockstore doesn't have the tower_root slot because of
+                // (replayed_root < tower_root) in this else clause, meaning the tower is from
+                // the future from the view of blockstore.
+                // Pretend the blockstore has the future tower_root to anchor exactly with that
+                // slot by adding tower_root to a slot history. The added slot will be newer
+                // than all slots in the slot history (remember tower_root > replayed_root),
+                // satisfying the slot history invariant.
+                // Thus, the whole process will be safe as well because tower_root exists
+                // within both tower and slot history, guaranteeing the success of adjustment
+                // and retaining all of future votes correctly while sanitizing.
+                warped_slot_history.add(tower_root);
+
+                self.adjust_lockouts_with_slot_history(&warped_slot_history)?;
+                // don't update root; future tower's root should be kept across validator
+                // restarts to continue to show the scary messages at restarts until the next
+                // voting.
             }
-            self.adjust_lockouts_with_slot_history(slot_history)?;
-            self.initialize_root(replayed_root);
+        } else {
+            // This else clause is for newly created tower.
+            // initialize_lockouts_from_bank() should ensure the following invariant,
+            // otherwise we're screwing something up.
+            assert_eq!(tower_root, replayed_root);
         }
 
         Ok(self)
@@ -921,11 +957,12 @@ impl Tower {
             }
 
             if let Some(checked_slot) = checked_slot {
-                // This is really special, only if tower is initialized (root = slot 0) for genesis and contains
-                // a vote (= slot 0) for the genesis, the slot 0 can repeat only once
-                let voting_from_genesis = *slot_in_tower == checked_slot && *slot_in_tower == 0;
+                // This is really special, only if tower is initialized and contains
+                // a vote for the root, the root slot can repeat only once
+                let voting_for_root =
+                    *slot_in_tower == checked_slot && *slot_in_tower == tower_root;
 
-                if !voting_from_genesis {
+                if !voting_for_root {
                     // Unless we're voting since genesis, slots_in_tower must always be older than last checked_slot
                     // including all vote slot and the root slot.
                     assert!(
@@ -992,10 +1029,12 @@ impl Tower {
         root: Slot,
         bank: &Bank,
     ) {
-        if let Some((_stake, vote_account)) = bank.vote_accounts().get(vote_account_pubkey) {
-            let vote_state = VoteState::deserialize(&vote_account.data)
-                .expect("vote_account isn't a VoteState?");
-            self.lockouts = vote_state;
+        if let Some((_stake, vote_account)) = bank.get_vote_account(vote_account_pubkey) {
+            self.lockouts = vote_account
+                .vote_state()
+                .as_ref()
+                .expect("vote_account isn't a VoteState?")
+                .clone();
             self.initialize_root(root);
             self.initialize_lockouts(|v| v.slot > root);
             trace!(
@@ -1116,6 +1155,9 @@ pub enum TowerError {
 
     #[error("The tower is fatally inconsistent with blockstore: {0}")]
     FatallyInconsistent(&'static str),
+
+    #[error("The tower is useless because of new hard fork: {0}")]
+    HardFork(Slot),
 }
 
 impl TowerError {
@@ -1151,8 +1193,11 @@ impl SavedTower {
     }
 }
 
-// Given an untimely crash, tower may have roots that are not reflected in blockstore because
-// `ReplayState::handle_votable_bank()` saves tower before setting blockstore roots
+// Given an untimely crash, tower may have roots that are not reflected in blockstore,
+// or the reverse of this.
+// That's because we don't impose any ordering guarantee or any kind of write barriers
+// between tower (plain old POSIX fs calls) and blockstore (through RocksDB), when
+// `ReplayState::handle_votable_bank()` saves tower before setting blockstore roots.
 pub fn reconcile_blockstore_roots_with_tower(
     tower: &Tower,
     blockstore: &Blockstore,
@@ -1172,12 +1217,23 @@ pub fn reconcile_blockstore_roots_with_tower(
                 ),
             })
             .collect();
-        assert!(
-            !new_roots.is_empty(),
-            "at least 1 parent slot must be found"
-        );
-
-        blockstore.set_roots(&new_roots)?;
+        if !new_roots.is_empty() {
+            info!(
+                "Reconciling slots as root based on tower root: {:?} ({}..{}) ",
+                new_roots, tower_root, last_blockstore_root
+            );
+            blockstore.set_roots(&new_roots)?;
+        } else {
+            // This indicates we're in bad state; but still don't panic here.
+            // That's because we might have a chance of recovering properly with
+            // newer snapshot.
+            warn!(
+                "Couldn't find any ancestor slots from tower root ({}) \
+                 towards blockstore root ({}); blockstore pruned or only \
+                 tower moved into new ledger?",
+                tower_root, last_blockstore_root,
+            );
+        }
     }
     Ok(())
 }
@@ -1186,7 +1242,6 @@ pub fn reconcile_blockstore_roots_with_tower(
 pub mod test {
     use super::*;
     use crate::{
-        bank_weight_fork_choice::BankWeightForkChoice,
         cluster_info_vote_listener::VoteTracker,
         cluster_slots::ClusterSlots,
         fork_choice::SelectVoteAndResetForkResult,
@@ -1196,6 +1251,7 @@ pub mod test {
     };
     use solana_ledger::{blockstore::make_slot_entries, get_tmp_ledger_path};
     use solana_runtime::{
+        accounts_background_service::ABSRequestSender,
         bank::Bank,
         bank_forks::BankForks,
         genesis_utils::{
@@ -1203,7 +1259,8 @@ pub mod test {
         },
     };
     use solana_sdk::{
-        clock::Slot, hash::Hash, pubkey::Pubkey, signature::Signer, slot_history::SlotHistory,
+        account::Account, clock::Slot, hash::Hash, pubkey::Pubkey, signature::Signer,
+        slot_history::SlotHistory,
     };
     use solana_vote_program::{
         vote_state::{Vote, VoteStateVersions, MAX_LOCKOUT_HISTORY},
@@ -1325,7 +1382,6 @@ pub mod test {
                 &self.bank_forks,
                 &mut PubkeyReferences::default(),
                 &mut self.heaviest_subtree_fork_choice,
-                &mut BankWeightForkChoice::default(),
             );
 
             let vote_bank = self
@@ -1368,7 +1424,7 @@ pub mod test {
                 new_root,
                 &self.bank_forks,
                 &mut self.progress,
-                &None,
+                &ABSRequestSender::default(),
                 &mut PubkeyReferences::default(),
                 None,
                 &mut self.heaviest_subtree_fork_choice,
@@ -1521,22 +1577,27 @@ pub mod test {
         (bank_forks, progress, heaviest_subtree_fork_choice)
     }
 
-    fn gen_stakes(stake_votes: &[(u64, &[u64])]) -> Vec<(Pubkey, (u64, Account))> {
+    fn gen_stakes(stake_votes: &[(u64, &[u64])]) -> Vec<(Pubkey, (u64, ArcVoteAccount))> {
         let mut stakes = vec![];
         for (lamports, votes) in stake_votes {
-            let mut account = Account::default();
-            account.data = vec![0; VoteState::size_of()];
-            account.lamports = *lamports;
+            let mut account = Account {
+                data: vec![0; VoteState::size_of()],
+                lamports: *lamports,
+                ..Account::default()
+            };
             let mut vote_state = VoteState::default();
             for slot in *votes {
                 vote_state.process_slot_vote_unchecked(*slot);
             }
             VoteState::serialize(
-                &VoteStateVersions::Current(Box::new(vote_state)),
+                &VoteStateVersions::new_current(vote_state),
                 &mut account.data,
             )
             .expect("serialize state");
-            stakes.push((solana_sdk::pubkey::new_rand(), (*lamports, account)));
+            stakes.push((
+                solana_sdk::pubkey::new_rand(),
+                (*lamports, ArcVoteAccount::from(account)),
+            ));
         }
         stakes
     }
@@ -1890,16 +1951,16 @@ pub mod test {
         }
 
         info!("local tower: {:#?}", tower.lockouts.votes);
-        let vote_accounts = vote_simulator
+        let observed = vote_simulator
             .bank_forks
             .read()
             .unwrap()
             .get(next_unlocked_slot)
             .unwrap()
-            .vote_accounts();
-        let observed = vote_accounts.get(&vote_pubkey).unwrap();
-        let state = VoteState::from(&observed.1).unwrap();
-        info!("observed tower: {:#?}", state.votes);
+            .get_vote_account(&vote_pubkey)
+            .unwrap();
+        let state = observed.1.vote_state();
+        info!("observed tower: {:#?}", state.as_ref().unwrap().votes);
 
         let num_slots_to_try = 200;
         cluster_votes
@@ -2006,7 +2067,7 @@ pub mod test {
     #[test]
     fn test_check_vote_threshold_without_votes() {
         let tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 1 as Stake)].into_iter().collect();
+        let stakes = vec![(0, 1)].into_iter().collect();
         assert!(tower.check_vote_stake_threshold(0, &stakes, 2));
     }
 
@@ -2016,7 +2077,7 @@ pub mod test {
         let mut tower = Tower::new_for_tests(4, 0.67);
         let mut stakes = HashMap::new();
         for i in 0..(MAX_LOCKOUT_HISTORY as u64 + 1) {
-            stakes.insert(i, 1 as Stake);
+            stakes.insert(i, 1);
             tower.record_vote(i, Hash::default());
         }
         assert!(!tower.check_vote_stake_threshold(MAX_LOCKOUT_HISTORY as u64 + 1, &stakes, 2,));
@@ -2025,7 +2086,7 @@ pub mod test {
     #[test]
     fn test_is_slot_confirmed_not_enough_stake_failure() {
         let tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 1 as Stake)].into_iter().collect();
+        let stakes = vec![(0, 1)].into_iter().collect();
         assert!(!tower.is_slot_confirmed(0, &stakes, 2));
     }
 
@@ -2039,7 +2100,7 @@ pub mod test {
     #[test]
     fn test_is_slot_confirmed_pass() {
         let tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 2 as Stake)].into_iter().collect();
+        let stakes = vec![(0, 2)].into_iter().collect();
         assert!(tower.is_slot_confirmed(0, &stakes, 2));
     }
 
@@ -2152,14 +2213,14 @@ pub mod test {
     #[test]
     fn test_check_vote_threshold_below_threshold() {
         let mut tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 1 as Stake)].into_iter().collect();
+        let stakes = vec![(0, 1)].into_iter().collect();
         tower.record_vote(0, Hash::default());
         assert!(!tower.check_vote_stake_threshold(1, &stakes, 2));
     }
     #[test]
     fn test_check_vote_threshold_above_threshold() {
         let mut tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 2 as Stake)].into_iter().collect();
+        let stakes = vec![(0, 2)].into_iter().collect();
         tower.record_vote(0, Hash::default());
         assert!(tower.check_vote_stake_threshold(1, &stakes, 2));
     }
@@ -2167,7 +2228,7 @@ pub mod test {
     #[test]
     fn test_check_vote_threshold_above_threshold_after_pop() {
         let mut tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 2 as Stake)].into_iter().collect();
+        let stakes = vec![(0, 2)].into_iter().collect();
         tower.record_vote(0, Hash::default());
         tower.record_vote(1, Hash::default());
         tower.record_vote(2, Hash::default());
@@ -2186,7 +2247,7 @@ pub mod test {
     fn test_check_vote_threshold_lockouts_not_updated() {
         solana_logger::setup();
         let mut tower = Tower::new_for_tests(1, 0.67);
-        let stakes = vec![(0, 1 as Stake), (1, 2 as Stake)].into_iter().collect();
+        let stakes = vec![(0, 1), (1, 2)].into_iter().collect();
         tower.record_vote(0, Hash::default());
         tower.record_vote(1, Hash::default());
         tower.record_vote(2, Hash::default());
@@ -2196,8 +2257,10 @@ pub mod test {
     #[test]
     fn test_stake_is_updated_for_entire_branch() {
         let mut voted_stakes = HashMap::new();
-        let mut account = Account::default();
-        account.lamports = 1;
+        let account = Account {
+            lamports: 1,
+            ..Account::default()
+        };
         let set: HashSet<u64> = vec![0u64, 1u64].into_iter().collect();
         let ancestors: HashMap<u64, HashSet<u64>> = [(2u64, set)].iter().cloned().collect();
         Tower::update_ancestor_voted_stakes(&mut voted_stakes, 2, account.lamports, &ancestors);
@@ -2209,10 +2272,10 @@ pub mod test {
     #[test]
     fn test_new_vote() {
         let local = VoteState::default();
-        let vote = Tower::new_vote(&local, 0, Hash::default(), None);
+        let (vote, tower_slots) = Tower::new_vote(&local, 0, Hash::default(), None);
         assert_eq!(local.votes.len(), 0);
-        assert_eq!(vote.0.slots, vec![0]);
-        assert_eq!(vote.1, 0);
+        assert_eq!(vote.slots, vec![0]);
+        assert_eq!(tower_slots, vec![0]);
     }
 
     #[test]
@@ -2232,9 +2295,9 @@ pub mod test {
         };
         local.process_vote_unchecked(&vote);
         assert_eq!(local.votes.len(), 1);
-        let vote = Tower::new_vote(&local, 1, Hash::default(), Some(0));
-        assert_eq!(vote.0.slots, vec![1]);
-        assert_eq!(vote.1, 1);
+        let (vote, tower_slots) = Tower::new_vote(&local, 1, Hash::default(), Some(0));
+        assert_eq!(vote.slots, vec![1]);
+        assert_eq!(tower_slots, vec![0, 1]);
     }
 
     #[test]
@@ -2247,10 +2310,10 @@ pub mod test {
         };
         local.process_vote_unchecked(&vote);
         assert_eq!(local.votes.len(), 1);
-        let vote = Tower::new_vote(&local, 3, Hash::default(), Some(0));
-        //first vote expired, so index should be 0
-        assert_eq!(vote.0.slots, vec![3]);
-        assert_eq!(vote.1, 0);
+        let (vote, tower_slots) = Tower::new_vote(&local, 3, Hash::default(), Some(0));
+        assert_eq!(vote.slots, vec![3]);
+        // First vote expired, so should be evicted from tower.
+        assert_eq!(tower_slots, vec![3]);
     }
 
     #[test]
@@ -2699,8 +2762,7 @@ pub mod test {
     }
 
     #[test]
-    #[should_panic(expected = "at least 1 parent slot must be found")]
-    fn test_reconcile_blockstore_roots_with_tower_panic_no_parent() {
+    fn test_reconcile_blockstore_roots_with_tower_nop_no_parent() {
         solana_logger::setup();
         let blockstore_path = get_tmp_ledger_path!();
         {
@@ -2716,7 +2778,9 @@ pub mod test {
 
             let mut tower = Tower::new_with_key(&Pubkey::default());
             tower.lockouts.root_slot = Some(4);
+            assert_eq!(blockstore.last_root(), 0);
             reconcile_blockstore_roots_with_tower(&tower, &blockstore).unwrap();
+            assert_eq!(blockstore.last_root(), 0);
         }
         Blockstore::destroy(&blockstore_path).expect("Expected successful database destruction");
     }
@@ -3039,6 +3103,23 @@ pub mod test {
     }
 
     #[test]
+    fn test_adjust_lockouts_after_replay_vote_on_root() {
+        let mut tower = Tower::new_for_tests(10, 0.9);
+        tower.lockouts.root_slot = Some(42);
+        tower.lockouts.votes.push_back(Lockout::new(42));
+        tower.lockouts.votes.push_back(Lockout::new(43));
+        tower.lockouts.votes.push_back(Lockout::new(44));
+        let vote = Vote::new(vec![44], Hash::default());
+        tower.last_vote = vote;
+
+        let mut slot_history = SlotHistory::default();
+        slot_history.add(42);
+
+        let tower = tower.adjust_lockouts_after_replay(42, &slot_history);
+        assert_eq!(tower.unwrap().voted_slots(), [43, 44]);
+    }
+
+    #[test]
     fn test_adjust_lockouts_after_replay_vote_on_genesis() {
         let mut tower = Tower::new_for_tests(10, 0.9);
         tower.lockouts.votes.push_back(Lockout::new(0));
@@ -3049,5 +3130,26 @@ pub mod test {
         slot_history.add(0);
 
         assert!(tower.adjust_lockouts_after_replay(0, &slot_history).is_ok());
+    }
+
+    #[test]
+    fn test_adjust_lockouts_after_replay_future_tower() {
+        let mut tower = Tower::new_for_tests(10, 0.9);
+        tower.lockouts.votes.push_back(Lockout::new(13));
+        tower.lockouts.votes.push_back(Lockout::new(14));
+        let vote = Vote::new(vec![14], Hash::default());
+        tower.last_vote = vote;
+        tower.initialize_root(12);
+
+        let mut slot_history = SlotHistory::default();
+        slot_history.add(0);
+        slot_history.add(2);
+
+        let tower = tower
+            .adjust_lockouts_after_replay(2, &slot_history)
+            .unwrap();
+        assert_eq!(tower.root(), 12);
+        assert_eq!(tower.voted_slots(), vec![13, 14]);
+        assert_eq!(tower.stray_restored_slot, Some(14));
     }
 }

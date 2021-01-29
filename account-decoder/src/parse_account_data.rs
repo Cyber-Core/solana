@@ -81,7 +81,7 @@ pub fn parse_account_data(
 ) -> Result<ParsedAccount, ParseAccountError> {
     let program_name = PARSABLE_PROGRAM_IDS
         .get(program_id)
-        .ok_or_else(|| ParseAccountError::ProgramNotParsable)?;
+        .ok_or(ParseAccountError::ProgramNotParsable)?;
     let additional_data = additional_data.unwrap_or_default();
     let parsed_json = match program_name {
         ParsableAccount::Config => serde_json::to_value(parse_config(data, pubkey)?)?,
@@ -118,7 +118,7 @@ mod test {
 
         let vote_state = VoteState::default();
         let mut vote_account_data: Vec<u8> = vec![0; VoteState::size_of()];
-        let versioned = VoteStateVersions::Current(Box::new(vote_state));
+        let versioned = VoteStateVersions::new_current(vote_state);
         VoteState::serialize(&versioned, &mut vote_account_data).unwrap();
         let parsed = parse_account_data(
             &account_pubkey,

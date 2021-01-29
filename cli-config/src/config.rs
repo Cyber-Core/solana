@@ -5,7 +5,7 @@ use url::Url;
 
 lazy_static! {
     pub static ref CONFIG_FILE: Option<String> = {
-        dirs::home_dir().map(|mut path| {
+        dirs_next::home_dir().map(|mut path| {
             path.extend(&[".config", "solana", "cli", "config.yml"]);
             path.to_str().unwrap().to_string()
         })
@@ -17,15 +17,16 @@ pub struct Config {
     pub json_rpc_url: String,
     pub websocket_url: String,
     pub keypair_path: String,
-
     #[serde(default)]
     pub address_labels: HashMap<String, String>,
+    #[serde(default)]
+    pub commitment: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         let keypair_path = {
-            let mut keypair_path = dirs::home_dir().expect("home directory");
+            let mut keypair_path = dirs_next::home_dir().expect("home directory");
             keypair_path.extend(&[".config", "solana", "id.json"]);
             keypair_path.to_str().unwrap().to_string()
         };
@@ -41,11 +42,14 @@ impl Default for Config {
             "System Program".to_string(),
         );
 
+        let commitment = "confirmed".to_string();
+
         Self {
             json_rpc_url,
             websocket_url,
             keypair_path,
             address_labels,
+            commitment,
         }
     }
 }
@@ -74,17 +78,6 @@ impl Config {
             ws_url.set_port(Some(port + 1)).expect("unable to set port");
         }
         ws_url.to_string()
-    }
-
-    pub fn compute_rpc_banks_url(json_rpc_url: &str) -> String {
-        let json_rpc_url: Option<Url> = json_rpc_url.parse().ok();
-        if json_rpc_url.is_none() {
-            return "".to_string();
-        }
-        let mut url = json_rpc_url.unwrap();
-        let port = url.port().unwrap_or(8899);
-        url.set_port(Some(port + 3)).expect("unable to set port");
-        url.to_string()
     }
 
     pub fn import_address_labels<P>(&mut self, filename: P) -> Result<(), io::Error>
@@ -132,29 +125,5 @@ mod test {
         );
 
         assert_eq!(Config::compute_websocket_url(&"garbage"), String::new());
-    }
-
-    #[test]
-    fn compute_rpc_banks_url() {
-        assert_eq!(
-            Config::compute_rpc_banks_url(&"http://devnet.solana.com"),
-            "http://devnet.solana.com:8902/".to_string()
-        );
-
-        assert_eq!(
-            Config::compute_rpc_banks_url(&"https://devnet.solana.com"),
-            "https://devnet.solana.com:8902/".to_string()
-        );
-
-        assert_eq!(
-            Config::compute_rpc_banks_url(&"http://example.com:8899"),
-            "http://example.com:8902/".to_string()
-        );
-        assert_eq!(
-            Config::compute_rpc_banks_url(&"https://example.com:1234"),
-            "https://example.com:1237/".to_string()
-        );
-
-        assert_eq!(Config::compute_rpc_banks_url(&"garbage"), String::new());
     }
 }

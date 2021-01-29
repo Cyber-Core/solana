@@ -4,10 +4,11 @@
 // hash on gossip. Monitor gossip for messages from validators in the --trusted-validators
 // set and halt the node if a mismatch is detected.
 
-use crate::cluster_info::{ClusterInfo, MAX_SNAPSHOT_HASHES};
-use solana_runtime::snapshot_package::{
-    AccountsPackage, AccountsPackageReceiver, AccountsPackageSender,
+use crate::{
+    cluster_info::{ClusterInfo, MAX_SNAPSHOT_HASHES},
+    snapshot_packager_service::PendingSnapshotPackage,
 };
+use solana_runtime::snapshot_package::{AccountsPackage, AccountsPackageReceiver};
 use solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey};
 use std::collections::{HashMap, HashSet};
 use std::{
@@ -27,7 +28,7 @@ pub struct AccountsHashVerifier {
 impl AccountsHashVerifier {
     pub fn new(
         accounts_package_receiver: AccountsPackageReceiver,
-        accounts_package_sender: Option<AccountsPackageSender>,
+        pending_snapshot_package: Option<PendingSnapshotPackage>,
         exit: &Arc<AtomicBool>,
         cluster_info: &Arc<ClusterInfo>,
         trusted_validators: Option<HashSet<Pubkey>>,
@@ -53,7 +54,7 @@ impl AccountsHashVerifier {
                                 &cluster_info,
                                 &trusted_validators,
                                 halt_on_trusted_validators_accounts_hash_mismatch,
-                                &accounts_package_sender,
+                                &pending_snapshot_package,
                                 &mut hashes,
                                 &exit,
                                 fault_injection_rate_slots,
@@ -76,24 +77,24 @@ impl AccountsHashVerifier {
         cluster_info: &ClusterInfo,
         trusted_validators: &Option<HashSet<Pubkey>>,
         halt_on_trusted_validator_accounts_hash_mismatch: bool,
-        accounts_package_sender: &Option<AccountsPackageSender>,
+        pending_snapshot_package: &Option<PendingSnapshotPackage>,
         hashes: &mut Vec<(Slot, Hash)>,
         exit: &Arc<AtomicBool>,
         fault_injection_rate_slots: u64,
         snapshot_interval_slots: u64,
     ) {
         if fault_injection_rate_slots != 0
-            && accounts_package.root % fault_injection_rate_slots == 0
+            && accounts_package.slot % fault_injection_rate_slots == 0
         {
             // For testing, publish an invalid hash to gossip.
             use rand::{thread_rng, Rng};
             use solana_sdk::hash::extend_and_hash;
-            warn!("inserting fault at slot: {}", accounts_package.root);
+            warn!("inserting fault at slot: {}", accounts_package.slot);
             let rand = thread_rng().gen_range(0, 10);
             let hash = extend_and_hash(&accounts_package.hash, &[rand]);
-            hashes.push((accounts_package.root, hash));
+            hashes.push((accounts_package.slot, hash));
         } else {
-            hashes.push((accounts_package.root, accounts_package.hash));
+            hashes.push((accounts_package.slot, accounts_package.hash));
         }
 
         while hashes.len() > MAX_SNAPSHOT_HASHES {
@@ -111,8 +112,8 @@ impl AccountsHashVerifier {
         }
 
         if accounts_package.block_height % snapshot_interval_slots == 0 {
-            if let Some(sender) = accounts_package_sender.as_ref() {
-                if sender.send(accounts_package).is_err() {}
+            if let Some(pending_snapshot_package) = pending_snapshot_package.as_ref() {
+                *pending_snapshot_package.lock().unwrap() = Some(accounts_package);
             }
         }
 
@@ -175,7 +176,7 @@ mod tests {
     use super::*;
     use crate::cluster_info::make_accounts_hashes_message;
     use crate::contact_info::ContactInfo;
-    use solana_runtime::bank_forks::CompressionType;
+    use solana_runtime::bank_forks::ArchiveFormat;
     use solana_runtime::snapshot_utils::SnapshotVersion;
     use solana_sdk::{
         hash::hash,
@@ -234,12 +235,12 @@ mod tests {
             let accounts_package = AccountsPackage {
                 hash: hash(&[i as u8]),
                 block_height: 100 + i as u64,
-                root: 100 + i as u64,
+                slot: 100 + i as u64,
                 slot_deltas: vec![],
                 snapshot_links,
                 tar_output_file: PathBuf::from("."),
                 storages: vec![],
-                compression: CompressionType::Bzip2,
+                archive_format: ArchiveFormat::TarBzip2,
                 snapshot_version: SnapshotVersion::default(),
             };
 
@@ -254,6 +255,9 @@ mod tests {
                 0,
                 100,
             );
+            // sleep for 1ms to create a newer timestmap for gossip entry
+            // otherwise the timestamp won't be newer.
+            std::thread::sleep(Duration::from_millis(1));
         }
         cluster_info.flush_push_queue();
         let cluster_hashes = cluster_info

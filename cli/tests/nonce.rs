@@ -9,8 +9,7 @@ use solana_client::{
     nonce_utils,
     rpc_client::RpcClient,
 };
-use solana_core::contact_info::ContactInfo;
-use solana_core::test_validator::{TestValidator, TestValidatorOptions};
+use solana_core::test_validator::TestValidator;
 use solana_faucet::faucet::run_local_faucet;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -19,69 +18,51 @@ use solana_sdk::{
     signature::{keypair_from_seed, Keypair, Signer},
     system_program,
 };
-use std::{fs::remove_dir_all, sync::mpsc::channel};
 
 #[test]
 fn test_nonce() {
-    solana_logger::setup();
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-
-    full_battery_tests(leader_data, alice, None, false);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
+    let mint_keypair = Keypair::new();
+    full_battery_tests(
+        TestValidator::with_no_fees(mint_keypair.pubkey()),
+        mint_keypair,
+        None,
+        false,
+    );
 }
 
 #[test]
 fn test_nonce_with_seed() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-
-    full_battery_tests(leader_data, alice, Some(String::from("seed")), false);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
+    let mint_keypair = Keypair::new();
+    full_battery_tests(
+        TestValidator::with_no_fees(mint_keypair.pubkey()),
+        mint_keypair,
+        Some(String::from("seed")),
+        false,
+    );
 }
 
 #[test]
 fn test_nonce_with_authority() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
-
-    full_battery_tests(leader_data, alice, None, true);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
+    let mint_keypair = Keypair::new();
+    full_battery_tests(
+        TestValidator::with_no_fees(mint_keypair.pubkey()),
+        mint_keypair,
+        None,
+        true,
+    );
 }
 
 fn full_battery_tests(
-    leader_data: ContactInfo,
-    alice: Keypair,
+    test_validator: TestValidator,
+    mint_keypair: Keypair,
     seed: Option<String>,
     use_nonce_authority: bool,
 ) {
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
-    let json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let json_rpc_url = test_validator.rpc_url();
 
     let mut config_payer = CliConfig::recent_for_tests();
     config_payer.json_rpc_url = json_rpc_url.clone();
@@ -231,21 +212,11 @@ fn full_battery_tests(
 
 #[test]
 fn test_create_account_with_seed() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice: mint_keypair,
-        ledger_path,
-        ..
-    } = TestValidator::run_with_options(TestValidatorOptions {
-        fees: 1,
-        bootstrap_validator_lamports: 42_000,
-        ..TestValidatorOptions::default()
-    });
+    solana_logger::setup();
+    let mint_keypair = Keypair::new();
+    let test_validator = TestValidator::with_custom_fees(mint_keypair.pubkey(), 1);
 
-    let (sender, receiver) = channel();
-    run_local_faucet(mint_keypair, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    let faucet_addr = run_local_faucet(mint_keypair, None);
 
     let offline_nonce_authority_signer = keypair_from_seed(&[1u8; 32]).unwrap();
     let online_nonce_creator_signer = keypair_from_seed(&[2u8; 32]).unwrap();
@@ -253,7 +224,8 @@ fn test_create_account_with_seed() {
     let config = CliConfig::recent_for_tests();
 
     // Setup accounts
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     request_and_confirm_airdrop(
         &rpc_client,
         &faucet_addr,
@@ -285,8 +257,7 @@ fn test_create_account_with_seed() {
     check_recent_balance(0, &rpc_client, &nonce_address);
 
     let mut creator_config = CliConfig::recent_for_tests();
-    creator_config.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    creator_config.json_rpc_url = test_validator.rpc_url();
     creator_config.signers = vec![&online_nonce_creator_signer];
     creator_config.command = CliCommand::CreateNonceAccount {
         nonce_account: 0,
@@ -304,7 +275,7 @@ fn test_create_account_with_seed() {
     let nonce_hash = nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_address,
-        CommitmentConfig::recent(),
+        CommitmentConfig::processed(),
     )
     .and_then(|ref a| nonce_utils::data_from_account(a))
     .unwrap()
@@ -336,8 +307,7 @@ fn test_create_account_with_seed() {
 
     // And submit it
     let mut submit_config = CliConfig::recent_for_tests();
-    submit_config.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    submit_config.json_rpc_url = test_validator.rpc_url();
     submit_config.signers = vec![&authority_presigner];
     submit_config.command = CliCommand::Transfer {
         amount: SpendAmount::Some(10),
@@ -358,7 +328,4 @@ fn test_create_account_with_seed() {
     check_recent_balance(31, &rpc_client, &offline_nonce_authority_signer.pubkey());
     check_recent_balance(4000, &rpc_client, &online_nonce_creator_signer.pubkey());
     check_recent_balance(10, &rpc_client, &to_address);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }

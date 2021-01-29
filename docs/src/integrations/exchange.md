@@ -107,9 +107,11 @@ possible to boot the node all the way from the genesis block.  Instead boot from
 a snapshot first and then add the `--no-snapshot-fetch` parameter for reboots.
 
 It is important to note that the amount of historical ledger available to your
-nodes is limited to what your trusted validators retain. You will need to ensure
-your nodes do not experience downtimes longer than this span, if ledger
-continuity is crucial for you.
+nodes from the rest of the network is limited at any point in time.  Once
+operational if your validators experience significant downtime they may not be
+able to catch up to the network and will need to download a new snapshot from a
+trusted validator.  In doing so your validators will now have a gap in its
+historical ledger data that cannot be filled.
 
 
 ### Minimizing Validator Port Exposure
@@ -150,11 +152,11 @@ generate a Solana keypair using any of our [wallet tools](../wallet-guide/cli.md
 
 We recommend using a unique deposit account for each of your users.
 
-Solana accounts are charged [rent](../apps/rent.md) on creation and once per
+Solana accounts are charged [rent](developing/programming-model/accounts.md#rent) on creation and once per
 epoch, but they can be made rent-exempt if they contain 2-years worth of rent in
 SOL. In order to find the minimum rent-exempt balance for your deposit accounts,
 query the
-[`getMinimumBalanceForRentExemption` endpoint](../apps/jsonrpc-api.md#getminimumbalanceforrentexemption):
+[`getMinimumBalanceForRentExemption` endpoint](developing/clients/jsonrpc-api.md#getminimumbalanceforrentexemption):
 
 ```bash
 curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc": "2.0","id":1,"method":"getMinimumBalanceForRentExemption","params":[0]}' localhost:8899
@@ -175,11 +177,11 @@ transfer to the appropriate deposit address.
 
 ### Poll for Blocks
 
-The easiest way to track all the deposit accounts for your exchange is to poll
-for each confirmed block and inspect for addresses of interest, using the
-JSON-RPC service of your Solana api node.
+To track all the deposit accounts for your exchange, poll for each confirmed
+block and inspect for addresses of interest, using the JSON-RPC service of your
+Solana API node.
 
-- To identify which blocks are available, send a [`getConfirmedBlocks` request](../apps/jsonrpc-api.md#getconfirmedblocks),
+- To identify which blocks are available, send a [`getConfirmedBlocks` request](developing/clients/jsonrpc-api.md#getconfirmedblocks),
   passing the last block you have already processed as the start-slot parameter:
 
 ```bash
@@ -190,7 +192,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc": "2.0","id":1,"m
 
 Not every slot produces a block, so there may be gaps in the sequence of integers.
 
-- For each block, request its contents with a [`getConfirmedBlock` request](../apps/jsonrpc-api.md#getconfirmedblock):
+- For each block, request its contents with a [`getConfirmedBlock` request](developing/clients/jsonrpc-api.md#getconfirmedblock):
 
 ```bash
 curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc": "2.0","id":1,"method":"getConfirmedBlock","params":[5, "json"]}' localhost:8899
@@ -271,27 +273,45 @@ can request the block from RPC in binary format, and parse it using either our
 
 ### Address History
 
-You can also query the transaction history of a specific address.
+You can also query the transaction history of a specific address. This is
+generally *not* a viable method for tracking all your deposit addresses over all
+slots, but may be useful for examining a few accounts for a specific period of
+time.
 
-- Send a [`getConfirmedSignaturesForAddress`](../apps/jsonrpc-api.md#getconfirmedsignaturesforaddress)
-  request to the api node, specifying a range of recent slots:
+- Send a [`getConfirmedSignaturesForAddress2`](developing/clients/jsonrpc-api.md#getconfirmedsignaturesforaddress2)
+  request to the api node:
 
 ```bash
-curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc": "2.0","id":1,"method":"getConfirmedSignaturesForAddress","params":["6H94zdiaYfRfPfKjYLjyr2VFBg6JHXygy84r3qhc3NsC", 0, 10]}' localhost:8899
+curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc": "2.0","id":1,"method":"getConfirmedSignaturesForAddress2","params":["6H94zdiaYfRfPfKjYLjyr2VFBg6JHXygy84r3qhc3NsC", {"limit": 3}]}' localhost:8899
 
 {
   "jsonrpc": "2.0",
   "result": [
-    "35YGay1Lwjwgxe9zaH6APSHbt9gYQUCtBWTNL3aVwVGn9xTFw2fgds7qK5AL29mP63A9j3rh8KpN1TgSR62XCaby",
-    "4bJdGN8Tt2kLWZ3Fa1dpwPSEkXWWTSszPSf1rRVsCwNjxbbUdwTeiWtmi8soA26YmwnKD4aAxNp8ci1Gjpdv4gsr",
-    "dhjhJp2V2ybQGVfELWM1aZy98guVVsxRCB5KhNiXFjCBMK5KEyzV8smhkVvs3xwkAug31KnpzJpiNPtcD5bG1t6"
+    {
+      "err": null,
+      "memo": null,
+      "signature": "35YGay1Lwjwgxe9zaH6APSHbt9gYQUCtBWTNL3aVwVGn9xTFw2fgds7qK5AL29mP63A9j3rh8KpN1TgSR62XCaby",
+      "slot": 114
+    },
+    {
+      "err": null,
+      "memo": null,
+      "signature": "4bJdGN8Tt2kLWZ3Fa1dpwPSEkXWWTSszPSf1rRVsCwNjxbbUdwTeiWtmi8soA26YmwnKD4aAxNp8ci1Gjpdv4gsr",
+      "slot": 112
+    },
+    {
+      "err": null,
+      "memo": null,
+      "signature": "dhjhJp2V2ybQGVfELWM1aZy98guVVsxRCB5KhNiXFjCBMK5KEyzV8smhkVvs3xwkAug31KnpzJpiNPtcD5bG1t6",
+      "slot": 108
+    }
   ],
   "id": 1
 }
 ```
 
 - For each signature returned, get the transaction details by sending a
-  [`getConfirmedTransaction`](../apps/jsonrpc-api.md#getconfirmedtransaction) request:
+  [`getConfirmedTransaction`](developing/clients/jsonrpc-api.md#getconfirmedtransaction) request:
 
 ```bash
 curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc": "2.0","id":1,"method":"getConfirmedTransaction","params":["dhjhJp2V2ybQGVfELWM1aZy98guVVsxRCB5KhNiXFjCBMK5KEyzV8smhkVvs3xwkAug31KnpzJpiNPtcD5bG1t6", "json"]}' localhost:8899
@@ -382,13 +402,14 @@ For greater flexibility, you can submit withdrawal transfers asynchronously. In
 these cases, it is your responsibility to verify that the transaction succeeded
 and was finalized by the cluster.
 
-**Note:** Each transaction contains a [recent blockhash](../transaction.md#blockhash-format)
-to indicate its liveness. It is **critical** to wait until this blockhash
-expires before retrying a withdrawal transfer that does not appear to have been
+**Note:** Each transaction contains a [recent
+blockhash](developing/programming-model/transactions.md#blockhash-format) to
+indicate its liveness. It is **critical** to wait until this blockhash expires
+before retrying a withdrawal transfer that does not appear to have been
 confirmed or finalized by the cluster. Otherwise, you risk a double spend. See
 more on [blockhash expiration](#blockhash-expiration) below.
 
-First, get a recent blockhash using the [`getFees` endpoint](../apps/jsonrpc-api.md#getfees)
+First, get a recent blockhash using the [`getFees` endpoint](developing/clients/jsonrpc-api.md#getfees)
 or the CLI command:
 
 ```bash
@@ -403,12 +424,12 @@ solana transfer <USER_ADDRESS> <AMOUNT> --no-wait --blockhash <RECENT_BLOCKHASH>
 ```
 
 You can also build, sign, and serialize the transaction manually, and fire it off to
-the cluster using the JSON-RPC [`sendTransaction` endpoint](../apps/jsonrpc-api.md#sendtransaction).
+the cluster using the JSON-RPC [`sendTransaction` endpoint](developing/clients/jsonrpc-api.md#sendtransaction).
 
 #### Transaction Confirmations & Finality
 
 Get the status of a batch of transactions using the
-[`getSignatureStatuses` JSON-RPC endpoint](../apps/jsonrpc-api.md#getsignaturestatuses).
+[`getSignatureStatuses` JSON-RPC endpoint](developing/clients/jsonrpc-api.md#getsignaturestatuses).
 The `confirmations` field reports how many
 [confirmed blocks](../terminology.md#confirmed-block) have elapsed since the
 transaction was processed. If `confirmations: null`, it is [finalized](../terminology.md#finality).
@@ -448,15 +469,15 @@ curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0", "id":1, "
 #### Blockhash Expiration
 
 When you request a recent blockhash for your withdrawal transaction using the
-[`getFees` endpoint](../apps/jsonrpc-api.md#getfees) or `solana fees`, the
+[`getFees` endpoint](developing/clients/jsonrpc-api.md#getfees) or `solana fees`, the
 response will include the `lastValidSlot`, the last slot in which the blockhash
 will be valid. You can check the cluster slot with a
-[`getSlot` query](../apps/jsonrpc-api.md#getslot); once the cluster slot is
+[`getSlot` query](developing/clients/jsonrpc-api.md#getslot); once the cluster slot is
 greater than `lastValidSlot`, the withdrawal transaction using that blockhash
 should never succeed.
 
 You can also doublecheck whether a particular blockhash is still valid by sending a
-[`getFeeCalculatorForBlockhash`](../apps/jsonrpc-api.md#getfeecalculatorforblockhash)
+[`getFeeCalculatorForBlockhash`](developing/clients/jsonrpc-api.md#getfeecalculatorforblockhash)
 request with the blockhash as a parameter. If the response value is null, the
 blockhash is expired, and the withdrawal transaction should never succeed.
 
@@ -550,10 +571,10 @@ SPL Token accounts are queried and modified using the `spl-token` command line
 utility. The examples provided in this section depend upon having it installed
 on the local system.
 
-`spl-token` is distributed from Rust [crates.io](https://crates.io) via the Rust
-`cargo` command line utility. The latest version of `cargo` can be installed
-using a handy one-liner for your platform at [rustup.rs](https://rustup.rs). Once
-`cargo` is installed, `spl-token` can be obtained with the following command:
+`spl-token` is distributed from Rust [crates.io](https://crates.io/crates/spl-token)
+via the Rust `cargo` command line utility. The latest version of `cargo` can be
+installed using a handy one-liner for your platform at [rustup.rs](https://rustup.rs).
+Once `cargo` is installed, `spl-token` can be obtained with the following command:
 
 ```
 cargo install spl-token-cli
@@ -576,16 +597,17 @@ spl-token-cli 2.0.1
 SPL Token accounts carry additional requirements that native System Program
 accounts do not:
 
-1. SPL Token accounts are not implicitly created, so must be created explicitly
-before an SPL Token balance can be deposited
-1. SPL Token accounts must remain [rent-exempt](https://docs.solana.com/apps/rent#rent-exemption)
+1. SPL Token accounts must be created before an amount of tokens can be
+deposited.   Token accounts can be created explicitly with the
+`spl-token create-account` command, or implicitly by the
+`spl-token transfer --fund-recipient ...` command.
+1. SPL Token accounts must remain [rent-exempt](developing/programming-model/accounts.md#rent-exemption)
 for the duration of their existence and therefore require a small amount of
 native SOL tokens be deposited at account creation. For SPL Token v2 accounts,
 this amount is 0.00203928 SOL (2,039,280 lamports).
 
 #### Command Line
 To create an SPL Token account with the following properties:
-1. At a random address
 1. Associated with the given mint
 1. Owned by the funding account's keypair
 
@@ -596,6 +618,14 @@ spl-token create-account <TOKEN_MINT_ADDRESS>
 #### Example
 ```
 $ spl-token create-account AkUFCWTXb3w9nY2n6SFJvBV6VwvFUCe4KBMCcgLsa2ir
+Creating account 6VzWGL51jLebvnDifvcuEDec17sK6Wupi4gYhm5RzfkV
+Signature: 4JsqZEPra2eDTHtHpB4FMWSfk3UgcCVmkKkP7zESZeMrKmFFkDkNd91pKP3vPVVZZPiu5XxyJwS73Vi5WsZL88D7
+```
+
+Or to create an SPL Token account with a specific keypair:
+```
+$ solana-keygen new -o token-account.json
+$ spl-token create-account AkUFCWTXb3w9nY2n6SFJvBV6VwvFUCe4KBMCcgLsa2ir token-account.json
 Creating account 6VzWGL51jLebvnDifvcuEDec17sK6Wupi4gYhm5RzfkV
 Signature: 4JsqZEPra2eDTHtHpB4FMWSfk3UgcCVmkKkP7zESZeMrKmFFkDkNd91pKP3vPVVZZPiu5XxyJwS73Vi5WsZL88D7
 ```
@@ -615,16 +645,17 @@ $ solana balance 6VzWGL51jLebvnDifvcuEDec17sK6Wupi4gYhm5RzfkV
 
 ### Token Transfers
 
-For SPL Token transfers to succeed, a few prerequisite conditions must be met:
-1. The recipient account must exist before the transfer is executed. As described
-in [account creation](#account-creation), SPL Token accounts are *not* explicitly
-created.
-1. Both the sender and recipient accounts must belong to the same mint.  SPL Token
-accounts can only hold one type of SPL token.
+The source account for a transfer is the actual token account that contains the
+amount.
+
+The recipient address however can be a normal wallet account.  If an associated
+token account for the given mint does not yet exist for that wallet, the
+transfer will create it provided that the `--fund-recipient` argument as
+provided.
 
 #### Command Line
 ```
-spl-token transfer <SENDER_ACCOUNT_PUBKEY> <AMOUNT> <RECIPIENT_ACCOUNT_PUBKEY>
+spl-token transfer <SENDER_ACCOUNT_ADDRESS> <AMOUNT> <RECIPIENT_WALLET_ADDRESS> --fund-recipient
 ```
 
 #### Example
@@ -647,7 +678,7 @@ method described above. Each new block should be scanned for successful transact
 issuing SPL Token [Transfer](https://github.com/solana-labs/solana-program-library/blob/096d3d4da51a8f63db5160b126ebc56b26346fc8/token/program/src/instruction.rs#L92)
 or [Transfer2](https://github.com/solana-labs/solana-program-library/blob/096d3d4da51a8f63db5160b126ebc56b26346fc8/token/program/src/instruction.rs#L252)
 instructions referencing user accounts, then querying the
-[token account balance](https://docs.solana.com/apps/jsonrpc-api#gettokenaccountbalance)
+[token account balance](developing/clients/jsonrpc-api.md#gettokenaccountbalance)
 updates.
 
 [Considerations](https://github.com/solana-labs/solana/issues/12318) are being
@@ -655,12 +686,24 @@ made to exend the `preBalance` and `postBalance` transaction status metadata
 fields to include SPL Token balance transfers.
 
 ### Withdrawing
-The withdrawal address a user provides must point to an initialized SPL Token account
-of the correct mint. Before executing a withdrawal [transfer](#token-transfers),
-it is recommended that the exchange check the address as
-[described above](#validating-user-supplied-account-addresses-for-withdrawals)
-as well as query the account to verify its existence and that it belongs to the
-correct mint.
+The withdrawal address a user provides should be the same address used for
+regular SOL withdrawal.
+
+Before executing a withdrawal [transfer](#token-transfers),
+the exchange should check the address as
+[described above](#validating-user-supplied-account-addresses-for-withdrawals).
+
+From the withdrawal address, the associated token account for the correct mint
+determined and the transfer issued to that account.  Note that it's possible
+that the associated token account does not yet exist, at which point the
+exchange should fund the account on behalf of the user.  For SPL Token v2
+accounts, funding the withdrawal account will require 0.00203928 SOL (2,039,280
+lamports).
+
+Template `spl-token transfer` command for a withdrawal:
+```
+$ spl-token transfer --fund-recipient <exchange token account> <withdrawal amount> <withdrawal address>
+```
 
 ### Other Considerations
 

@@ -5,13 +5,14 @@ extern crate test;
 use log::*;
 use solana_runtime::{bank::*, bank_client::BankClient, loader_utils::create_invoke_instruction};
 use solana_sdk::{
-    account::KeyedAccount,
     client::AsyncClient,
     client::SyncClient,
     clock::MAX_RECENT_BLOCKHASHES,
     genesis_config::create_genesis_config,
     instruction::InstructionError,
+    keyed_account::KeyedAccount,
     message::Message,
+    process_instruction::InvokeContext,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::Transaction,
@@ -29,10 +30,12 @@ const NOOP_PROGRAM_ID: [u8; 32] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
 ];
 
+#[allow(clippy::unnecessary_wraps)]
 fn process_instruction(
     _program_id: &Pubkey,
     _keyed_accounts: &[KeyedAccount],
     _data: &[u8],
+    _invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
     Ok(())
 }
@@ -123,12 +126,12 @@ fn do_bench_transactions(
     let (mut genesis_config, mint_keypair) = create_genesis_config(100_000_000);
     genesis_config.ticks_per_slot = 100;
     let mut bank = Bank::new(&genesis_config);
-    bank.add_builtin_program(
+    bank.add_builtin(
         "builtin_program",
         Pubkey::new(&BUILTIN_PROGRAM_ID),
         process_instruction,
     );
-    bank.add_native_program("solana_noop_program", &Pubkey::new(&NOOP_PROGRAM_ID));
+    bank.add_native_program("solana_noop_program", &Pubkey::new(&NOOP_PROGRAM_ID), false);
     let bank = Arc::new(bank);
     let bank_client = BankClient::new_shared(&bank);
     let transactions = create_transactions(&bank_client, &mint_keypair);

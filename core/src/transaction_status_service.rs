@@ -2,10 +2,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use itertools::izip;
 use solana_ledger::{blockstore::Blockstore, blockstore_processor::TransactionStatusBatch};
 use solana_runtime::{
-    bank::{Bank, HashAgeKind},
+    bank::{Bank, NonceRollbackInfo},
     transaction_utils::OrderedIterator,
 };
-use solana_sdk::nonce;
 use solana_transaction_status::{InnerInstructions, TransactionStatusMeta};
 use std::{
     sync::{
@@ -55,6 +54,7 @@ impl TransactionStatusService {
             iteration_order,
             statuses,
             balances,
+            token_balances,
             inner_instructions,
             transaction_logs,
         } = write_transaction_status_receiver.recv_timeout(Duration::from_secs(1))?;
@@ -62,9 +62,11 @@ impl TransactionStatusService {
         let slot = bank.slot();
         for (
             (_, transaction),
-            (status, hash_age_kind),
+            (status, nonce_rollback),
             pre_balances,
             post_balances,
+            pre_token_balances,
+            post_token_balances,
             inner_instructions,
             log_messages,
         ) in izip!(
@@ -72,17 +74,18 @@ impl TransactionStatusService {
             statuses,
             balances.pre_balances,
             balances.post_balances,
+            token_balances.pre_token_balances,
+            token_balances.post_token_balances,
             inner_instructions,
             transaction_logs
         ) {
             if Bank::can_commit(&status) && !transaction.signatures.is_empty() {
-                let fee_calculator = match hash_age_kind {
-                    Some(HashAgeKind::DurableNonce(_, account)) => {
-                        nonce::utils::fee_calculator_of(&account)
-                    }
-                    _ => bank.get_fee_calculator(&transaction.message().recent_blockhash),
-                }
-                .expect("FeeCalculator must exist");
+                let fee_calculator = nonce_rollback
+                    .map(|nonce_rollback| nonce_rollback.fee_calculator())
+                    .unwrap_or_else(|| {
+                        bank.get_fee_calculator(&transaction.message().recent_blockhash)
+                    })
+                    .expect("FeeCalculator must exist");
                 let fee = fee_calculator.calculate_fee(transaction.message());
                 let (writable_keys, readonly_keys) =
                     transaction.message.get_account_keys_by_lock_type();
@@ -100,6 +103,8 @@ impl TransactionStatusService {
                 });
 
                 let log_messages = Some(log_messages);
+                let pre_token_balances = Some(pre_token_balances);
+                let post_token_balances = Some(post_token_balances);
 
                 blockstore
                     .write_transaction_status(
@@ -114,6 +119,8 @@ impl TransactionStatusService {
                             post_balances,
                             inner_instructions,
                             log_messages,
+                            pre_token_balances,
+                            post_token_balances,
                         },
                     )
                     .expect("Expect database write to succeed");

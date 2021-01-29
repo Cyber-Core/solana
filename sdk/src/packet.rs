@@ -39,12 +39,10 @@ impl Packet {
         Self { data, meta }
     }
 
-    pub fn from_data<T: Serialize>(dest: &SocketAddr, data: T) -> Self {
-        let mut me = Packet::default();
-        if let Err(e) = Self::populate_packet(&mut me, Some(dest), &data) {
-            logger::error!("Couldn't write to packet {:?}. Data skipped.", e);
-        }
-        me
+    pub fn from_data<T: Serialize>(dest: &SocketAddr, data: T) -> Result<Self> {
+        let mut packet = Packet::default();
+        Self::populate_packet(&mut packet, Some(dest), &data)?;
+        Ok(packet)
     }
 
     pub fn populate_packet<T: Serialize>(
@@ -87,7 +85,7 @@ impl PartialEq for Packet {
     fn eq(&self, other: &Packet) -> bool {
         let self_data: &[u8] = self.data.as_ref();
         let other_data: &[u8] = other.data.as_ref();
-        self.meta == other.meta && self_data[..self.meta.size] == other_data[..other.meta.size]
+        self.meta == other.meta && self_data[..self.meta.size] == other_data[..self.meta.size]
     }
 }
 

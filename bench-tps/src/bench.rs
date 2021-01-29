@@ -8,7 +8,7 @@ use solana_measure::measure::Measure;
 use solana_metrics::{self, datapoint_info};
 use solana_sdk::{
     client::Client,
-    clock::{DEFAULT_TICKS_PER_SECOND, DEFAULT_TICKS_PER_SLOT, MAX_PROCESSING_AGE},
+    clock::{DEFAULT_S_PER_SLOT, MAX_PROCESSING_AGE},
     commitment_config::CommitmentConfig,
     fee_calculator::FeeCalculator,
     hash::Hash,
@@ -32,8 +32,7 @@ use std::{
 };
 
 // The point at which transactions become "too old", in seconds.
-const MAX_TX_QUEUE_AGE: u64 =
-    MAX_PROCESSING_AGE as u64 * DEFAULT_TICKS_PER_SLOT / DEFAULT_TICKS_PER_SECOND;
+const MAX_TX_QUEUE_AGE: u64 = (MAX_PROCESSING_AGE as f64 * DEFAULT_S_PER_SLOT) as u64;
 
 pub const MAX_SPENDS_PER_TX: u64 = 4;
 
@@ -48,7 +47,7 @@ pub type SharedTransactions = Arc<RwLock<VecDeque<Vec<(Transaction, u64)>>>>;
 
 fn get_recent_blockhash<T: Client>(client: &T) -> (Hash, FeeCalculator) {
     loop {
-        match client.get_recent_blockhash_with_commitment(CommitmentConfig::recent()) {
+        match client.get_recent_blockhash_with_commitment(CommitmentConfig::processed()) {
             Ok((blockhash, fee_calculator, _last_valid_slot)) => {
                 return (blockhash, fee_calculator)
             }
@@ -497,7 +496,7 @@ fn do_tx_transfers<T: Client>(
 
 fn verify_funding_transfer<T: Client>(client: &Arc<T>, tx: &Transaction, amount: u64) -> bool {
     for a in &tx.message().account_keys[1..] {
-        match client.get_balance_with_commitment(a, CommitmentConfig::recent()) {
+        match client.get_balance_with_commitment(a, CommitmentConfig::processed()) {
             Ok(balance) => return balance >= amount,
             Err(err) => error!("failed to get balance {:?}", err),
         }
@@ -762,7 +761,7 @@ pub fn airdrop_lamports<T: Client>(
         };
 
         let current_balance = client
-            .get_balance_with_commitment(&id.pubkey(), CommitmentConfig::recent())
+            .get_balance_with_commitment(&id.pubkey(), CommitmentConfig::processed())
             .unwrap_or_else(|e| {
                 info!("airdrop error {}", e);
                 starting_balance
@@ -938,10 +937,12 @@ mod tests {
         let bank = Bank::new(&genesis_config);
         let client = Arc::new(BankClient::new(bank));
 
-        let mut config = Config::default();
-        config.id = id;
-        config.tx_count = 10;
-        config.duration = Duration::from_secs(5);
+        let config = Config {
+            id,
+            tx_count: 10,
+            duration: Duration::from_secs(5),
+            ..Config::default()
+        };
 
         let keypair_count = config.tx_count * config.keypair_multiplier;
         let keypairs =
@@ -965,7 +966,7 @@ mod tests {
         for kp in &keypairs {
             assert_eq!(
                 client
-                    .get_balance_with_commitment(&kp.pubkey(), CommitmentConfig::recent())
+                    .get_balance_with_commitment(&kp.pubkey(), CommitmentConfig::processed())
                     .unwrap(),
                 lamports
             );

@@ -1,5 +1,7 @@
 //! The `genesis_config` module is a library for generating the chain's genesis config.
 
+#![cfg(feature = "full")]
+
 use crate::{
     account::Account,
     clock::{UnixTimestamp, DEFAULT_TICKS_PER_SLOT},
@@ -18,7 +20,7 @@ use crate::{
 };
 use bincode::{deserialize, serialize};
 use chrono::{TimeZone, Utc};
-use memmap::Mmap;
+use memmap2::Mmap;
 use std::{
     collections::BTreeMap,
     fmt,
@@ -59,7 +61,7 @@ impl FromStr for ClusterType {
     }
 }
 
-#[frozen_abi(digest = "DEg4N5ps9EdEBL2H2ahU54SCcw3QphtPjh48H413fvNq")]
+#[frozen_abi(digest = "VxfEg5DXq5czYouMdcCbqDzUE8jGi3iSDSjzrrWp5iG")]
 #[derive(Serialize, Deserialize, Debug, Clone, AbiExample)]
 pub struct GenesisConfig {
     /// when the network (bootstrap validator) was started relative to the UNIX Epoch
@@ -145,6 +147,11 @@ impl GenesisConfig {
     pub fn hash(&self) -> Hash {
         let serialized = serialize(&self).unwrap();
         hash(&serialized)
+    }
+
+    pub fn disable_cap_altering_features_for_preciseness(&mut self) {
+        self.accounts
+            .remove(&crate::feature_set::simple_capitalization::id());
     }
 
     fn genesis_filename(ledger_path: &Path) -> PathBuf {

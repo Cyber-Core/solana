@@ -134,6 +134,12 @@ void sol_log_64_(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 #define sol_log_64 sol_log_64_
 
 /**
+ * Prints the current compute unit consumption to stdout
+ */
+void sol_log_compute_units_();
+#define sol_log_compute_units() sol_log_compute_units_()
+
+/**
  * Size of Public key in bytes
  */
 #define SIZE_PUBKEY 32
@@ -246,6 +252,20 @@ static void *sol_calloc(size_t nitems, size_t size) {
 static void sol_free(void *ptr) {
   (void) sol_alloc_free_(0, ptr);
 }
+
+/**
+ * The Solana runtime provides a memory region that is available to programs at
+ * a fixed virtual address and length. The builtin functions `sol_calloc` and
+ * `sol_free` call into the Solana runtime to allocate from this memory region
+ * for heap operations.  Because the memory region is directly available to
+ * programs another option is a program can implement their own heap directly on
+ * top of that region.  If a program chooses to implement their own heap they
+ * should not call the builtin heap functions because they will conflict.
+ * `HEAP_START_ADDRESS` and `HEAP_LENGTH` specify the memory region's start
+ * virtual address and length.
+ */
+#define HEAP_START_ADDRESS (uint64_t)0x300000000
+#define HEAP_LENGTH (uint64_t)(32 * 1024)
 
 /**
  * Panics
@@ -459,14 +479,31 @@ typedef struct {
  *
  * @param seeds Seed bytes used to sign program accounts
  * @param seeds_len Length of the seeds array
- * @param Progam id of the signer
- * @param Program address created, filled on return
+ * @param program_id Program id of the signer
+ * @param program_address Program address created, filled on return
  */
 static uint64_t sol_create_program_address(
     const SolSignerSeed *seeds,
     int seeds_len,
     const SolPubkey *program_id,
-    const SolPubkey *address
+    const SolPubkey *program_address
+);
+
+/**
+ * Try to find a program address and return corresponding bump seed
+ *
+ * @param seeds Seed bytes used to sign program accounts
+ * @param seeds_len Length of the seeds array
+ * @param program_id Program id of the signer
+ * @param program_address Program address created, filled on return
+ * @param bump_seed Bump seed required to create a valid program address
+ */
+static uint64_t sol_try_find_program_address(
+    const SolSignerSeed *seeds,
+    int seeds_len,
+    const SolPubkey *program_id,
+    const SolPubkey *program_address,
+    const uint8_t *bump_seed
 );
 
 /**
@@ -600,14 +637,28 @@ uint64_t entrypoint(const uint8_t *input);
 
 #ifdef SOL_TEST
 /**
- * Stub log functions when building tests
+ * Stub functions when building tests
  */
 #include <stdio.h>
 void sol_log_(const char *s, uint64_t len) {
-  printf("sol_log: %s\n", s);
+  printf("Program log: %s\n", s);
 }
 void sol_log_64(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
-  printf("sol_log_64: %llu, %llu, %llu, %llu, %llu\n", arg1, arg2, arg3, arg4, arg5);
+  printf("Program log: %llu, %llu, %llu, %llu, %llu\n", arg1, arg2, arg3, arg4, arg5);
+}
+void sol_log_pubkey(const SolPubkey *pubkey) {
+  printf("Program log: ");
+  for (int i = 0; i < SIZE_PUBKEY; i++) {
+    printf("%02 ", pubkey->x[i]);
+  }
+  printf("\n");
+}
+void sol_log_compute_units_() {
+  printf("Program consumption: __ units remaining\n");
+}
+void sol_panic_(const char *file, uint64_t len, uint64_t line, uint64_t column) {
+  printf("Panic in %s at %d:%d\n", file, line, column);
+  abort();
 }
 #endif
 

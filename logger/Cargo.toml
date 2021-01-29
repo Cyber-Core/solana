@@ -1,6 +1,6 @@
 [package]
 name = "solana-logger"
-version = "1.5.0"
+version = "1.6.0"
 description = "Solana Logger"
 authors = ["Solana Maintainers <maintainers@solana.foundation>"]
 repository = "https://github.com/solana-labs/solana"
@@ -9,9 +9,9 @@ homepage = "https://solana.com/"
 edition = "2018"
 
 [dependencies]
-env_logger = "0.7.1"
+env_logger = "0.8.2"
 lazy_static = "1.4.0"
-log = "0.4.8"
+log = "0.4.11"
 
 [lib]
 name = "solana_logger"

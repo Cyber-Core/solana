@@ -18,6 +18,7 @@ use solana_perf::perf_libs;
 use solana_perf::recycler::Recycler;
 use solana_rayon_threadlimit::get_thread_count;
 use solana_sdk::hash::Hash;
+use solana_sdk::packet::PACKET_DATA_SIZE;
 use solana_sdk::timing;
 use solana_sdk::transaction::Transaction;
 use std::cell::RefCell;
@@ -490,20 +491,24 @@ impl EntrySlice for [Entry] {
     }
 
     fn verify_transaction_signatures(&self, secp256k1_program_enabled: bool) -> bool {
+        let verify = |tx: &Transaction| {
+            tx.verify().is_ok()
+                && {
+                    match bincode::serialized_size(tx) {
+                        Ok(size) => size <= PACKET_DATA_SIZE as u64,
+                        Err(_) => false,
+                    }
+                }
+                && (
+                    // Verify tx precompiles if secp256k1 program is enabled.
+                    !secp256k1_program_enabled || tx.verify_precompiles().is_ok()
+                )
+        };
         PAR_THREAD_POOL.with(|thread_pool| {
             thread_pool.borrow().install(|| {
-                self.par_iter().all(|e| {
-                    e.transactions.par_iter().all(|transaction| {
-                        let sig_verify = transaction.verify().is_ok();
-                        if sig_verify
-                            && secp256k1_program_enabled
-                            && transaction.verify_precompiles().is_err()
-                        {
-                            return false;
-                        }
-                        sig_verify
-                    })
-                })
+                self.par_iter()
+                    .flat_map(|entry| &entry.transactions)
+                    .all(verify)
             })
         })
     }
@@ -622,7 +627,7 @@ impl EntrySlice for [Entry] {
         }
 
         for entry in self {
-            *tick_hash_count += entry.num_hashes;
+            *tick_hash_count = tick_hash_count.saturating_add(entry.num_hashes);
             if entry.is_tick() {
                 if *tick_hash_count != hashes_per_tick {
                     warn!(
@@ -690,7 +695,7 @@ mod tests {
     use chrono::prelude::Utc;
     use solana_budget_program::budget_instruction;
     use solana_sdk::{
-        hash::{hash, Hash},
+        hash::{hash, new_rand as hash_new_rand, Hash},
         message::Message,
         signature::{Keypair, Signer},
         system_transaction,
@@ -897,55 +902,164 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_transaction_signatures_packet_data_size() {
+        let mut rng = rand::thread_rng();
+        let recent_blockhash = hash_new_rand(&mut rng);
+        let keypair = Keypair::new();
+        let pubkey = keypair.pubkey();
+        let budget_contract = Keypair::new();
+        let budget_pubkey = budget_contract.pubkey();
+        let make_transaction = |size| {
+            let ixs: Vec<_> = std::iter::repeat_with(|| {
+                budget_instruction::payment(&pubkey, &pubkey, &budget_pubkey, 1)
+            })
+            .take(size)
+            .flat_map(|x| x.into_iter())
+            .collect();
+            let message = Message::new(&ixs[..], Some(&pubkey));
+            Transaction::new(&[&keypair, &budget_contract], message, recent_blockhash)
+        };
+        // Small transaction.
+        {
+            let tx = make_transaction(5);
+            let entries = vec![next_entry(&recent_blockhash, 1, vec![tx.clone()])];
+            assert!(bincode::serialized_size(&tx).unwrap() <= PACKET_DATA_SIZE as u64);
+            assert!(entries[..].verify_transaction_signatures(false));
+        }
+        // Big transaction.
+        {
+            let tx = make_transaction(15);
+            let entries = vec![next_entry(&recent_blockhash, 1, vec![tx.clone()])];
+            assert!(bincode::serialized_size(&tx).unwrap() > PACKET_DATA_SIZE as u64);
+            assert!(!entries[..].verify_transaction_signatures(false));
+        }
+        // Assert that verify fails as soon as serialized
+        // size exceeds packet data size.
+        for size in 1..20 {
+            let tx = make_transaction(size);
+            let entries = vec![next_entry(&recent_blockhash, 1, vec![tx.clone()])];
+            assert_eq!(
+                bincode::serialized_size(&tx).unwrap() <= PACKET_DATA_SIZE as u64,
+                entries[..].verify_transaction_signatures(false),
+            );
+        }
+    }
+
+    #[test]
     fn test_verify_tick_hash_count() {
         let hashes_per_tick = 10;
         let tx = Transaction::default();
-        let tx_entry = Entry::new(&Hash::default(), 1, vec![tx]);
-        let full_tick_entry = Entry::new_tick(hashes_per_tick, &Hash::default());
-        let partial_tick_entry = Entry::new_tick(hashes_per_tick - 1, &Hash::default());
+
+        let no_hash_tx_entry = Entry {
+            transactions: vec![tx.clone()],
+            ..Entry::default()
+        };
+        let single_hash_tx_entry = Entry {
+            transactions: vec![tx.clone()],
+            num_hashes: 1,
+            ..Entry::default()
+        };
+        let partial_tx_entry = Entry {
+            num_hashes: hashes_per_tick - 1,
+            transactions: vec![tx.clone()],
+            ..Entry::default()
+        };
+        let full_tx_entry = Entry {
+            num_hashes: hashes_per_tick,
+            transactions: vec![tx.clone()],
+            ..Entry::default()
+        };
+        let max_hash_tx_entry = Entry {
+            transactions: vec![tx],
+            num_hashes: u64::MAX,
+            ..Entry::default()
+        };
+
         let no_hash_tick_entry = Entry::new_tick(0, &Hash::default());
         let single_hash_tick_entry = Entry::new_tick(1, &Hash::default());
+        let partial_tick_entry = Entry::new_tick(hashes_per_tick - 1, &Hash::default());
+        let full_tick_entry = Entry::new_tick(hashes_per_tick, &Hash::default());
+        let max_hash_tick_entry = Entry::new_tick(u64::MAX, &Hash::default());
 
-        let no_ticks = vec![];
+        // empty batch should succeed if hashes_per_tick hasn't been reached
         let mut tick_hash_count = 0;
-        assert!(no_ticks.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        let mut entries = vec![];
+        assert!(entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
         assert_eq!(tick_hash_count, 0);
 
-        // validation is disabled when hashes_per_tick == 0
-        let no_hash_tick = vec![no_hash_tick_entry.clone()];
-        assert!(no_hash_tick.verify_tick_hash_count(&mut tick_hash_count, 0));
-        assert_eq!(tick_hash_count, 0);
-
-        // validation is disabled when hashes_per_tick == 0
-        let tx_and_no_hash_tick = vec![tx_entry.clone(), no_hash_tick_entry];
-        assert!(tx_and_no_hash_tick.verify_tick_hash_count(&mut tick_hash_count, 0));
-        assert_eq!(tick_hash_count, 0);
-
-        let single_tick = vec![full_tick_entry];
-        assert!(single_tick.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
-        assert_eq!(tick_hash_count, 0);
-        assert!(!single_tick.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick - 1));
+        // empty batch should fail if hashes_per_tick has been reached
+        tick_hash_count = hashes_per_tick;
+        assert!(!entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
         assert_eq!(tick_hash_count, hashes_per_tick);
         tick_hash_count = 0;
 
-        let ticks_and_txs = vec![tx_entry.clone(), partial_tick_entry.clone()];
-        assert!(ticks_and_txs.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        // validation is disabled when hashes_per_tick == 0
+        entries = vec![max_hash_tx_entry.clone()];
+        assert!(entries.verify_tick_hash_count(&mut tick_hash_count, 0));
         assert_eq!(tick_hash_count, 0);
 
-        let partial_tick = vec![partial_tick_entry];
-        assert!(!partial_tick.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        // partial tick should fail
+        entries = vec![partial_tick_entry.clone()];
+        assert!(!entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
         assert_eq!(tick_hash_count, hashes_per_tick - 1);
         tick_hash_count = 0;
 
-        let tx_entries: Vec<Entry> = (0..hashes_per_tick - 1).map(|_| tx_entry.clone()).collect();
-        let tx_entries_and_tick = [tx_entries, vec![single_hash_tick_entry]].concat();
-        assert!(tx_entries_and_tick.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        // full tick entry should succeed
+        entries = vec![no_hash_tx_entry, full_tick_entry.clone()];
+        assert!(entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
         assert_eq!(tick_hash_count, 0);
 
-        let too_many_tx_entries: Vec<Entry> =
-            (0..hashes_per_tick).map(|_| tx_entry.clone()).collect();
-        assert!(!too_many_tx_entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        // oversized tick entry should fail
+        assert!(!entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick - 1));
         assert_eq!(tick_hash_count, hashes_per_tick);
+        tick_hash_count = 0;
+
+        // partial tx entry without tick entry should succeed
+        entries = vec![partial_tx_entry];
+        assert!(entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        assert_eq!(tick_hash_count, hashes_per_tick - 1);
+        tick_hash_count = 0;
+
+        // full tx entry with tick entry should succeed
+        entries = vec![full_tx_entry.clone(), no_hash_tick_entry];
+        assert!(entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        assert_eq!(tick_hash_count, 0);
+
+        // full tx entry with oversized tick entry should fail
+        entries = vec![full_tx_entry.clone(), single_hash_tick_entry.clone()];
+        assert!(!entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        assert_eq!(tick_hash_count, hashes_per_tick + 1);
+        tick_hash_count = 0;
+
+        // full tx entry without tick entry should fail
+        entries = vec![full_tx_entry];
+        assert!(!entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        assert_eq!(tick_hash_count, hashes_per_tick);
+        tick_hash_count = 0;
+
+        // tx entry and a tick should succeed
+        entries = vec![single_hash_tx_entry.clone(), partial_tick_entry];
+        assert!(entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        assert_eq!(tick_hash_count, 0);
+
+        // many tx entries and a tick should succeed
+        let tx_entries: Vec<Entry> = (0..hashes_per_tick - 1)
+            .map(|_| single_hash_tx_entry.clone())
+            .collect();
+        entries = [tx_entries, vec![single_hash_tick_entry]].concat();
+        assert!(entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        assert_eq!(tick_hash_count, 0);
+
+        // check overflow saturation should fail
+        entries = vec![full_tick_entry.clone(), max_hash_tick_entry];
+        assert!(!entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        assert_eq!(tick_hash_count, u64::MAX);
+        tick_hash_count = 0;
+
+        // check overflow saturation should fail
+        entries = vec![max_hash_tx_entry, full_tick_entry];
+        assert!(!entries.verify_tick_hash_count(&mut tick_hash_count, hashes_per_tick));
+        assert_eq!(tick_hash_count, u64::MAX);
     }
 
     #[test]

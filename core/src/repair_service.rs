@@ -5,7 +5,6 @@ use crate::{
     cluster_info_vote_listener::VerifiedVoteReceiver,
     cluster_slots::ClusterSlots,
     repair_weight::RepairWeight,
-    repair_weighted_traversal::Contains,
     result::Result,
     serve_repair::{RepairType, ServeRepair, DEFAULT_NONCE},
 };
@@ -15,7 +14,9 @@ use solana_ledger::{
     shred::Nonce,
 };
 use solana_measure::measure::Measure;
-use solana_runtime::{bank::Bank, bank_forks::BankForks, commitment::VOTE_THRESHOLD_SIZE};
+use solana_runtime::{
+    bank::Bank, bank_forks::BankForks, commitment::VOTE_THRESHOLD_SIZE, contains::Contains,
+};
 use solana_sdk::{clock::Slot, epoch_schedule::EpochSchedule, pubkey::Pubkey, timing::timestamp};
 use std::{
     collections::{HashMap, HashSet},
@@ -286,7 +287,24 @@ impl RepairService {
                 let repair_total = repair_stats.shred.count
                     + repair_stats.highest_shred.count
                     + repair_stats.orphan.count;
-                info!("repair_stats: {:?}", repair_stats);
+                let slot_to_count: Vec<_> = repair_stats
+                    .shred
+                    .slot_pubkeys
+                    .iter()
+                    .chain(repair_stats.highest_shred.slot_pubkeys.iter())
+                    .chain(repair_stats.orphan.slot_pubkeys.iter())
+                    .map(|(slot, slot_repairs)| {
+                        (
+                            slot,
+                            slot_repairs
+                                .pubkey_repairs
+                                .iter()
+                                .map(|(_key, count)| count)
+                                .sum::<u64>(),
+                        )
+                    })
+                    .collect();
+                info!("repair_stats: {:?}", slot_to_count);
                 if repair_total > 0 {
                     datapoint_info!(
                         "serve_repair-repair",
@@ -385,12 +403,12 @@ impl RepairService {
     }
 
     /// Repairs any fork starting at the input slot
-    pub fn generate_repairs_for_fork(
+    pub fn generate_repairs_for_fork<'a>(
         blockstore: &Blockstore,
         repairs: &mut Vec<RepairType>,
         max_repairs: usize,
         slot: Slot,
-        duplicate_slot_repair_statuses: &dyn Contains<Slot>,
+        duplicate_slot_repair_statuses: &impl Contains<'a, Slot>,
     ) {
         let mut pending_slots = vec![slot];
         while repairs.len() < max_repairs && !pending_slots.is_empty() {
@@ -719,7 +737,7 @@ mod test {
             let num_slots = 2;
 
             // Create some shreds
-            let (mut shreds, _) = make_many_slot_entries(0, num_slots as u64, 150 as u64);
+            let (mut shreds, _) = make_many_slot_entries(0, num_slots as u64, 150);
             let num_shreds = shreds.len() as u64;
             let num_shreds_per_slot = num_shreds / num_slots;
 
@@ -835,9 +853,10 @@ mod test {
             // sides of the range)
             for start in 0..slots.len() {
                 for end in start..slots.len() {
-                    let mut repair_slot_range = RepairSlotRange::default();
-                    repair_slot_range.start = slots[start];
-                    repair_slot_range.end = slots[end];
+                    let repair_slot_range = RepairSlotRange {
+                        start: slots[start],
+                        end: slots[end],
+                    };
                     let expected: Vec<RepairType> = (repair_slot_range.start
                         ..=repair_slot_range.end)
                         .map(|slot_index| {
@@ -890,9 +909,7 @@ mod test {
                 RepairType::HighestShred(end, 0),
             ];
 
-            let mut repair_slot_range = RepairSlotRange::default();
-            repair_slot_range.start = 2;
-            repair_slot_range.end = end;
+            let repair_slot_range = RepairSlotRange { start: 2, end };
 
             assert_eq!(
                 RepairService::generate_repairs_in_range(

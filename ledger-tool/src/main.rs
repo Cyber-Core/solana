@@ -5,10 +5,13 @@ use clap::{
 use itertools::Itertools;
 use log::*;
 use regex::Regex;
+use serde::Serialize;
 use serde_json::json;
 use solana_clap_utils::{
     input_parsers::{cluster_type_of, pubkey_of, pubkeys_of},
-    input_validators::{is_parsable, is_pubkey_or_keypair, is_slot, is_valid_percentage},
+    input_validators::{
+        is_parsable, is_pubkey, is_pubkey_or_keypair, is_slot, is_valid_percentage,
+    },
 };
 use solana_ledger::entry::Entry;
 use solana_ledger::{
@@ -18,10 +21,11 @@ use solana_ledger::{
     blockstore_db::{self, AccessType, BlockstoreRecoveryMode, Column, Database},
     blockstore_processor::ProcessOptions,
     rooted_slot_iterator::RootedSlotIterator,
+    shred::Shred,
 };
 use solana_runtime::{
-    bank::Bank,
-    bank_forks::{BankForks, CompressionType, SnapshotConfig},
+    bank::{Bank, RewardCalculationEvent},
+    bank_forks::{ArchiveFormat, BankForks, SnapshotConfig},
     hardened_unpack::{open_genesis_config, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE},
     snapshot_utils,
     snapshot_utils::SnapshotVersion,
@@ -29,6 +33,8 @@ use solana_runtime::{
 use solana_sdk::{
     account::Account,
     clock::{Epoch, Slot},
+    feature::{self, Feature},
+    feature_set,
     genesis_config::{ClusterType, GenesisConfig},
     hash::Hash,
     inflation::Inflation,
@@ -38,7 +44,7 @@ use solana_sdk::{
     shred_version::compute_shred_version,
     system_program,
 };
-use solana_stake_program::stake_state::{self, StakeState};
+use solana_stake_program::stake_state::{self, PointValue, StakeState};
 use solana_vote_program::{
     self,
     vote_state::{self, VoteState},
@@ -64,30 +70,23 @@ enum LedgerOutputMethod {
     Json,
 }
 
-fn output_slot_rewards(
-    blockstore: &Blockstore,
-    slot: Slot,
-    method: &LedgerOutputMethod,
-) -> Result<(), String> {
+fn output_slot_rewards(blockstore: &Blockstore, slot: Slot, method: &LedgerOutputMethod) {
     // Note: rewards are not output in JSON yet
     if *method == LedgerOutputMethod::Print {
-        if let Ok(rewards) = blockstore.read_rewards(slot) {
-            if let Some(rewards) = rewards {
-                if !rewards.is_empty() {
-                    println!("  Rewards:");
-                    for reward in rewards {
-                        println!(
-                            "    Account {}: {}{} SOL",
-                            reward.pubkey,
-                            if reward.lamports < 0 { '-' } else { ' ' },
-                            lamports_to_sol(reward.lamports.abs().try_into().unwrap())
-                        );
-                    }
+        if let Ok(Some(rewards)) = blockstore.read_rewards(slot) {
+            if !rewards.is_empty() {
+                println!("  Rewards:");
+                for reward in rewards {
+                    println!(
+                        "    Account {}: {}{} SOL",
+                        reward.pubkey,
+                        if reward.lamports < 0 { '-' } else { ' ' },
+                        lamports_to_sol(reward.lamports.abs().try_into().unwrap())
+                    );
                 }
             }
         }
     }
-    Ok(())
 }
 
 fn output_entry(
@@ -175,7 +174,7 @@ fn output_slot(
             output_entry(blockstore, method, slot, entry_index, entry);
         }
 
-        output_slot_rewards(blockstore, slot, method)?;
+        output_slot_rewards(blockstore, slot, method);
     } else if verbose_level >= 1 {
         let mut transactions = 0;
         let mut hashes = 0;
@@ -296,6 +295,7 @@ fn graph_forks(bank_forks: &BankForks, include_all_votes: bool) -> String {
 
     // Search all forks and collect the last vote made by each validator
     let mut last_votes = HashMap::new();
+    let default_vote_state = VoteState::default();
     for fork_slot in &fork_slots {
         let bank = &bank_forks[*fork_slot];
 
@@ -305,7 +305,8 @@ fn graph_forks(bank_forks: &BankForks, include_all_votes: bool) -> String {
             .map(|(_, (stake, _))| stake)
             .sum();
         for (_, (stake, vote_account)) in bank.vote_accounts() {
-            let vote_state = VoteState::from(&vote_account).unwrap_or_default();
+            let vote_state = vote_account.vote_state();
+            let vote_state = vote_state.as_ref().unwrap_or(&default_vote_state);
             if let Some(last_vote) = vote_state.votes.iter().last() {
                 let entry = last_votes.entry(vote_state.node_pubkey).or_insert((
                     last_vote.slot,
@@ -314,7 +315,7 @@ fn graph_forks(bank_forks: &BankForks, include_all_votes: bool) -> String {
                     total_stake,
                 ));
                 if entry.0 < last_vote.slot {
-                    *entry = (last_vote.slot, vote_state, stake, total_stake);
+                    *entry = (last_vote.slot, vote_state.clone(), stake, total_stake);
                 }
             }
         }
@@ -345,7 +346,8 @@ fn graph_forks(bank_forks: &BankForks, include_all_votes: bool) -> String {
         let mut first = true;
         loop {
             for (_, (_, vote_account)) in bank.vote_accounts() {
-                let vote_state = VoteState::from(&vote_account).unwrap_or_default();
+                let vote_state = vote_account.vote_state();
+                let vote_state = vote_state.as_ref().unwrap_or(&default_vote_state);
                 if let Some(last_vote) = vote_state.votes.iter().last() {
                     let validator_votes = all_votes.entry(vote_state.node_pubkey).or_default();
                     validator_votes
@@ -517,7 +519,7 @@ fn analyze_column<
     db: &Database,
     name: &str,
     key_size: usize,
-) -> Result<(), String> {
+) {
     let mut key_tot: u64 = 0;
     let mut val_hist = histogram::Histogram::new();
     let mut val_tot: u64 = 0;
@@ -578,38 +580,34 @@ fn analyze_column<
     };
 
     println!("{}", serde_json::to_string_pretty(&json_result).unwrap());
-
-    Ok(())
 }
 
-fn analyze_storage(database: &Database) -> Result<(), String> {
+fn analyze_storage(database: &Database) {
     use blockstore_db::columns::*;
-    analyze_column::<SlotMeta>(database, "SlotMeta", SlotMeta::key_size())?;
-    analyze_column::<Orphans>(database, "Orphans", Orphans::key_size())?;
-    analyze_column::<DeadSlots>(database, "DeadSlots", DeadSlots::key_size())?;
-    analyze_column::<ErasureMeta>(database, "ErasureMeta", ErasureMeta::key_size())?;
-    analyze_column::<Root>(database, "Root", Root::key_size())?;
-    analyze_column::<Index>(database, "Index", Index::key_size())?;
-    analyze_column::<ShredData>(database, "ShredData", ShredData::key_size())?;
-    analyze_column::<ShredCode>(database, "ShredCode", ShredCode::key_size())?;
+    analyze_column::<SlotMeta>(database, "SlotMeta", SlotMeta::key_size());
+    analyze_column::<Orphans>(database, "Orphans", Orphans::key_size());
+    analyze_column::<DeadSlots>(database, "DeadSlots", DeadSlots::key_size());
+    analyze_column::<ErasureMeta>(database, "ErasureMeta", ErasureMeta::key_size());
+    analyze_column::<Root>(database, "Root", Root::key_size());
+    analyze_column::<Index>(database, "Index", Index::key_size());
+    analyze_column::<ShredData>(database, "ShredData", ShredData::key_size());
+    analyze_column::<ShredCode>(database, "ShredCode", ShredCode::key_size());
     analyze_column::<TransactionStatus>(
         database,
         "TransactionStatus",
         TransactionStatus::key_size(),
-    )?;
+    );
     analyze_column::<TransactionStatus>(
         database,
         "TransactionStatusIndex",
         TransactionStatusIndex::key_size(),
-    )?;
+    );
     analyze_column::<AddressSignatures>(
         database,
         "AddressSignatures",
         AddressSignatures::key_size(),
-    )?;
-    analyze_column::<Rewards>(database, "Rewards", Rewards::key_size())?;
-
-    Ok(())
+    );
+    analyze_column::<Rewards>(database, "Rewards", Rewards::key_size());
 }
 
 fn open_blockstore(
@@ -617,7 +615,7 @@ fn open_blockstore(
     access_type: AccessType,
     wal_recovery_mode: Option<BlockstoreRecoveryMode>,
 ) -> Blockstore {
-    match Blockstore::open_with_access_type(ledger_path, access_type, wal_recovery_mode) {
+    match Blockstore::open_with_access_type(ledger_path, access_type, wal_recovery_mode, true) {
         Ok(blockstore) => blockstore,
         Err(err) => {
             eprintln!("Failed to open ledger at {:?}: {:?}", ledger_path, err);
@@ -647,7 +645,7 @@ fn hardforks_of(matches: &ArgMatches<'_>, name: &str) -> Option<Vec<Slot>> {
 
 fn load_bank_forks(
     arg_matches: &ArgMatches,
-    ledger_path: &PathBuf,
+    ledger_path: &Path,
     genesis_config: &GenesisConfig,
     process_options: ProcessOptions,
     access_type: AccessType,
@@ -655,7 +653,7 @@ fn load_bank_forks(
     snapshot_archive_path: Option<PathBuf>,
 ) -> bank_forks_utils::LoadResult {
     let blockstore = open_blockstore(&ledger_path, access_type, wal_recovery_mode);
-    let snapshot_path = ledger_path.clone().join(if blockstore.is_primary_access() {
+    let snapshot_path = ledger_path.join(if blockstore.is_primary_access() {
         "snapshot"
     } else {
         "snapshot.ledger-tool"
@@ -664,12 +662,12 @@ fn load_bank_forks(
         None
     } else {
         let snapshot_package_output_path =
-            snapshot_archive_path.unwrap_or_else(|| ledger_path.clone());
+            snapshot_archive_path.unwrap_or_else(|| ledger_path.to_path_buf());
         Some(SnapshotConfig {
             snapshot_interval_slots: 0, // Value doesn't matter
             snapshot_package_output_path,
             snapshot_path,
-            compression: CompressionType::Bzip2,
+            archive_format: ArchiveFormat::TarBzip2,
             snapshot_version: SnapshotVersion::default(),
         })
     };
@@ -696,6 +694,7 @@ fn load_bank_forks(
         &genesis_config,
         &blockstore,
         account_paths,
+        None,
         snapshot_config.as_ref(),
         process_options,
         None,
@@ -733,6 +732,11 @@ fn main() {
         .takes_value(true)
         .default_value("0")
         .help("Start at this slot");
+    let ending_slot_arg = Arg::with_name("ending_slot")
+        .long("ending-slot")
+        .value_name("SLOT")
+        .takes_value(true)
+        .help("The last slot to iterate to");
     let no_snapshot_arg = Arg::with_name("no_snapshot")
         .long("no-snapshot")
         .takes_value(false)
@@ -918,13 +922,7 @@ fn main() {
             SubCommand::with_name("parse_full_frozen")
             .about("Parses log for information about critical events about ancestors of the given `ending_slot`")
             .arg(&starting_slot_arg)
-            .arg(
-                Arg::with_name("ending_slot")
-                    .long("ending-slot")
-                    .value_name("SLOT")
-                    .takes_value(true)
-                    .help("The last slot to iterate to"),
-            )
+            .arg(&ending_slot_arg)
             .arg(
                 Arg::with_name("log_path")
                     .long("log-path")
@@ -965,6 +963,12 @@ fn main() {
             .about("Prints the ledger's shred hash")
             .arg(&hard_forks_arg)
             .arg(&max_genesis_archive_unpacked_size_arg)
+        )
+        .subcommand(
+            SubCommand::with_name("shred-meta")
+            .about("Prints raw shred metadata")
+            .arg(&starting_slot_arg)
+            .arg(&ending_slot_arg)
         )
         .subcommand(
             SubCommand::with_name("bank-hash")
@@ -1127,11 +1131,14 @@ fn main() {
             )
             .arg(&hashes_per_tick)
             .arg(
-                Arg::with_name("rehash")
+                Arg::with_name("accounts_to_remove")
                     .required(false)
-                    .long("rehash")
-                    .takes_value(false)
-                    .help("Re-calculate the bank hash and overwrite the original bank hash."),
+                    .long("remove-account")
+                    .takes_value(true)
+                    .value_name("PUBKEY")
+                    .validator(is_pubkey)
+                    .multiple(true)
+                    .help("List if accounts to remove while creating the snapshot"),
             )
             .arg(
                 Arg::with_name("remove_stake_accounts")
@@ -1178,11 +1185,27 @@ fn main() {
                            which could be an epoch in a galaxy far far away"),
             )
             .arg(
-                Arg::with_name("enable_inflation")
+                Arg::with_name("inflation")
                     .required(false)
-                    .long("enable-inflation")
+                    .long("inflation")
+                    .takes_value(true)
+                    .possible_values(&["pico", "full", "none"])
+                    .help("Overwrite inflation when warping"),
+            )
+            .arg(
+                Arg::with_name("enable_stake_program_v2")
+                    .required(false)
+                    .long("enable-stake-program-v2")
                     .takes_value(false)
-                    .help("Always enable inflation when warping even if it's disabled"),
+                    .help("Enable stake program v2 (several inflation-related staking \
+                           bugs are feature-gated behind this)"),
+            )
+            .arg(
+                Arg::with_name("enable_simple_capitalization")
+                    .required(false)
+                    .long("enable-simple-capitalization")
+                    .takes_value(false)
+                    .help("Enable simple capitalization to test hardcoded cap adjustments"),
             )
             .arg(
                 Arg::with_name("recalculate_capitalization")
@@ -1191,6 +1214,13 @@ fn main() {
                     .takes_value(false)
                     .help("Recalculate capitalization before warping; circumvents \
                           bank's out-of-sync capitalization"),
+            )
+            .arg(
+                Arg::with_name("csv_filename")
+                    .long("csv-filename")
+                    .value_name("FILENAME")
+                    .takes_value(true)
+                    .help("Output file in the csv format"),
             )
         ).subcommand(
             SubCommand::with_name("purge")
@@ -1399,6 +1429,46 @@ fn main() {
                 Err(err) => {
                     eprintln!("Failed to load ledger: {:?}", err);
                     exit(1);
+                }
+            }
+        }
+        ("shred-meta", Some(arg_matches)) => {
+            #[derive(Debug)]
+            struct ShredMeta<'a> {
+                slot: Slot,
+                full_slot: bool,
+                shred_index: usize,
+                data: bool,
+                code: bool,
+                last_in_slot: bool,
+                data_complete: bool,
+                shred: &'a Shred,
+            }
+            let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
+            let ending_slot = value_t!(arg_matches, "ending_slot", Slot).unwrap_or(Slot::MAX);
+            let ledger = open_blockstore(&ledger_path, AccessType::TryPrimaryThenSecondary, None);
+            for (slot, _meta) in ledger
+                .slot_meta_iterator(starting_slot)
+                .unwrap()
+                .take_while(|(slot, _)| *slot <= ending_slot)
+            {
+                let full_slot = ledger.is_full(slot);
+                if let Ok(shreds) = ledger.get_data_shreds_for_slot(slot, 0) {
+                    for (shred_index, shred) in shreds.iter().enumerate() {
+                        println!(
+                            "{:#?}",
+                            ShredMeta {
+                                slot,
+                                full_slot,
+                                shred_index,
+                                data: shred.is_data(),
+                                code: shred.is_code(),
+                                data_complete: shred.data_complete(),
+                                last_in_slot: shred.last_in_slot(),
+                                shred,
+                            }
+                        );
+                    }
                 }
             }
         }
@@ -1635,7 +1705,6 @@ fn main() {
             let snapshot_slot = value_t_or_exit!(arg_matches, "snapshot_slot", Slot);
             let output_directory = value_t_or_exit!(arg_matches, "output_directory", String);
             let mut warp_slot = value_t!(arg_matches, "warp_slot", Slot).ok();
-            let mut rehash = arg_matches.is_present("rehash");
             let remove_stake_accounts = arg_matches.is_present("remove_stake_accounts");
             let new_hard_forks = hardforks_of(arg_matches, "hard_forks");
 
@@ -1657,6 +1726,8 @@ fn main() {
                 exit(1);
             }
             let bootstrap_validator_pubkeys = pubkeys_of(&arg_matches, "bootstrap_validator");
+            let accounts_to_remove =
+                pubkeys_of(&arg_matches, "accounts_to_remove").unwrap_or_default();
 
             let snapshot_version =
                 arg_matches
@@ -1711,7 +1782,6 @@ fn main() {
                     }
 
                     if let Some(faucet_pubkey) = faucet_pubkey {
-                        rehash = true;
                         bank.store_account(
                             &faucet_pubkey,
                             &Account::new(faucet_lamports, 0, &system_program::id()),
@@ -1728,9 +1798,14 @@ fn main() {
                         }
                     }
 
-                    if let Some(bootstrap_validator_pubkeys) = bootstrap_validator_pubkeys {
-                        rehash = true;
+                    for address in accounts_to_remove {
+                        if let Some(mut account) = bank.get_account(&address) {
+                            account.lamports = 0;
+                            bank.store_account(&address, &account);
+                        }
+                    }
 
+                    if let Some(bootstrap_validator_pubkeys) = bootstrap_validator_pubkeys {
                         assert_eq!(bootstrap_validator_pubkeys.len() % 3, 0);
 
                         // Ensure there are no duplicated pubkeys in the --bootstrap-validator list
@@ -1837,55 +1912,32 @@ fn main() {
                         snapshot_version,
                         bank.slot(),
                     );
-                    assert!(bank.is_complete());
-                    bank.squash();
-                    bank.clean_accounts(true);
-                    bank.update_accounts_hash();
-                    if rehash {
-                        bank.rehash();
-                    }
 
-                    let temp_dir = tempfile::tempdir_in(ledger_path).unwrap_or_else(|err| {
-                        eprintln!("Unable to create temporary directory: {}", err);
+                    let archive_file = snapshot_utils::bank_to_snapshot_archive(
+                        ledger_path,
+                        &bank,
+                        Some(snapshot_version),
+                        output_directory,
+                        ArchiveFormat::TarZstd,
+                    )
+                    .unwrap_or_else(|err| {
+                        eprintln!("Unable to create snapshot: {}", err);
                         exit(1);
                     });
 
-                    let storages: Vec<_> = bank.get_snapshot_storages();
-                    snapshot_utils::add_snapshot(&temp_dir, &bank, &storages, snapshot_version)
-                        .and_then(|slot_snapshot_paths| {
-                            snapshot_utils::package_snapshot(
-                                &bank,
-                                &slot_snapshot_paths,
-                                &temp_dir,
-                                bank.src.slot_deltas(&bank.src.roots()),
-                                output_directory,
-                                storages,
-                                CompressionType::Bzip2,
-                                snapshot_version,
-                            )
-                        })
-                        .and_then(|package| {
-                            snapshot_utils::archive_snapshot_package(&package).map(|ok| {
-                                println!(
-                                    "Successfully created snapshot for slot {}, hash {}: {:?}",
-                                    bank.slot(),
-                                    bank.hash(),
-                                    package.tar_output_file
-                                );
-                                println!(
-                                    "Shred version: {}",
-                                    compute_shred_version(
-                                        &genesis_config.hash(),
-                                        Some(&bank.hard_forks().read().unwrap())
-                                    )
-                                );
-                                ok
-                            })
-                        })
-                        .unwrap_or_else(|err| {
-                            eprintln!("Unable to create snapshot archive: {}", err);
-                            exit(1);
-                        });
+                    println!(
+                        "Successfully created snapshot for slot {}, hash {}: {}",
+                        bank.slot(),
+                        bank.hash(),
+                        archive_file.display(),
+                    );
+                    println!(
+                        "Shred version: {}",
+                        compute_shred_version(
+                            &genesis_config.hash(),
+                            Some(&bank.hard_forks().read().unwrap())
+                        )
+                    );
                 }
                 Err(err) => {
                     eprintln!("Failed to load ledger: {:?}", err);
@@ -2001,8 +2053,13 @@ fn main() {
                             exit(1);
                         }
 
-                        if arg_matches.is_present("enable_inflation") {
-                            let inflation = Inflation::default();
+                        if let Ok(raw_inflation) = value_t!(arg_matches, "inflation", String) {
+                            let inflation = match raw_inflation.as_str() {
+                                "pico" => Inflation::pico(),
+                                "full" => Inflation::full(),
+                                "none" => Inflation::new_disabled(),
+                                _ => unreachable!(),
+                            };
                             println!(
                                 "Forcing to: {:?} (was: {:?})",
                                 inflation,
@@ -2014,41 +2071,468 @@ fn main() {
                         let next_epoch = base_bank
                             .epoch_schedule()
                             .get_first_slot_in_epoch(warp_epoch);
-                        let warped_bank =
-                            Bank::new_from_parent(&base_bank, base_bank.collector_id(), next_epoch);
+                        // disable eager rent collection because this creates many unrelated
+                        // rent collection account updates
+                        base_bank
+                            .lazy_rent_collection
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+                        let feature_account_balance = std::cmp::max(
+                            genesis_config.rent.minimum_balance(Feature::size_of()),
+                            1,
+                        );
+                        if arg_matches.is_present("enable_simple_capitalization") {
+                            if base_bank
+                                .get_account(&feature_set::simple_capitalization::id())
+                                .is_none()
+                            {
+                                base_bank.store_account(
+                                    &feature_set::simple_capitalization::id(),
+                                    &feature::create_account(
+                                        &Feature { activated_at: None },
+                                        feature_account_balance,
+                                    ),
+                                );
+                                if base_bank
+                                    .get_account(&feature_set::cumulative_rent_related_fixes::id())
+                                    .is_some()
+                                {
+                                    // steal some lamports from the pretty old feature not to affect
+                                    // capitalizaion, which doesn't affect inflation behavior!
+                                    base_bank.store_account(
+                                        &feature_set::cumulative_rent_related_fixes::id(),
+                                        &Account::default(),
+                                    );
+                                } else {
+                                    let old_cap = base_bank.set_capitalization();
+                                    let new_cap = base_bank.capitalization();
+                                    warn!(
+                                        "Skewing capitalization a bit to enable simple capitalization as \
+                                        requested: increasing {} from {} to {}",
+                                        feature_account_balance, old_cap, new_cap,
+                                    );
+                                    assert_eq!(old_cap + feature_account_balance, new_cap);
+                                }
+                            } else {
+                                warn!("Already simple_capitalization is activated (or scheduled)");
+                            }
+                        }
+                        if arg_matches.is_present("enable_stake_program_v2") {
+                            let mut force_enabled_count = 0;
+                            if base_bank
+                                .get_account(&feature_set::stake_program_v2::id())
+                                .is_none()
+                            {
+                                base_bank.store_account(
+                                    &feature_set::stake_program_v2::id(),
+                                    &feature::create_account(
+                                        &Feature { activated_at: None },
+                                        feature_account_balance,
+                                    ),
+                                );
+                                force_enabled_count += 1;
+                            }
+                            if base_bank
+                                .get_account(&feature_set::rewrite_stake::id())
+                                .is_none()
+                            {
+                                base_bank.store_account(
+                                    &feature_set::rewrite_stake::id(),
+                                    &feature::create_account(
+                                        &Feature { activated_at: None },
+                                        feature_account_balance,
+                                    ),
+                                );
+                                force_enabled_count += 1;
+                            }
+
+                            if force_enabled_count == 0 {
+                                warn!("Already stake_program_v2 is activated (or scheduled)");
+                            }
+
+                            let mut store_failed_count = 0;
+                            if force_enabled_count >= 1 {
+                                if base_bank
+                                    .get_account(&feature_set::secp256k1_program_enabled::id())
+                                    .is_some()
+                                {
+                                    // steal some lamports from the pretty old feature not to affect
+                                    // capitalizaion, which doesn't affect inflation behavior!
+                                    base_bank.store_account(
+                                        &feature_set::secp256k1_program_enabled::id(),
+                                        &Account::default(),
+                                    );
+                                    force_enabled_count -= 1;
+                                } else {
+                                    store_failed_count += 1;
+                                }
+                            }
+
+                            if force_enabled_count >= 1 {
+                                if base_bank
+                                    .get_account(&feature_set::instructions_sysvar_enabled::id())
+                                    .is_some()
+                                {
+                                    // steal some lamports from the pretty old feature not to affect
+                                    // capitalizaion, which doesn't affect inflation behavior!
+                                    base_bank.store_account(
+                                        &feature_set::instructions_sysvar_enabled::id(),
+                                        &Account::default(),
+                                    );
+                                    force_enabled_count -= 1;
+                                } else {
+                                    store_failed_count += 1;
+                                }
+                            }
+                            assert_eq!(force_enabled_count, store_failed_count);
+                            if store_failed_count >= 1 {
+                                // we have no choice; maybe locally created blank cluster with
+                                // not-Development cluster type.
+                                let old_cap = base_bank.set_capitalization();
+                                let new_cap = base_bank.capitalization();
+                                warn!(
+                                    "Skewing capitalization a bit to enable stake_program_v2 as \
+                                     requested: increasing {} from {} to {}",
+                                    feature_account_balance, old_cap, new_cap,
+                                );
+                                assert_eq!(
+                                    old_cap + feature_account_balance * store_failed_count,
+                                    new_cap
+                                );
+                            }
+                        }
+
+                        #[derive(Default, Debug)]
+                        struct PointDetail {
+                            epoch: Epoch,
+                            points: u128,
+                            stake: u128,
+                            credits: u128,
+                        }
+
+                        #[derive(Default, Debug)]
+                        struct CalculationDetail {
+                            epochs: usize,
+                            voter: Pubkey,
+                            voter_owner: Pubkey,
+                            current_effective_stake: u64,
+                            total_stake: u64,
+                            rent_exempt_reserve: u64,
+                            points: Vec<PointDetail>,
+                            base_rewards: u64,
+                            commission: u8,
+                            vote_rewards: u64,
+                            stake_rewards: u64,
+                            activation_epoch: Epoch,
+                            deactivation_epoch: Option<Epoch>,
+                            point_value: Option<PointValue>,
+                            old_credits_observed: Option<u64>,
+                            new_credits_observed: Option<u64>,
+                        }
+                        use solana_stake_program::stake_state::InflationPointCalculationEvent;
+                        let mut stake_calcuration_details: HashMap<Pubkey, CalculationDetail> =
+                            HashMap::new();
+                        let mut last_point_value = None;
+                        let tracer = |event: &RewardCalculationEvent| {
+                            // Currently RewardCalculationEvent enum has only Staking variant
+                            // because only staking tracing is supported!
+                            #[allow(irrefutable_let_patterns)]
+                            if let RewardCalculationEvent::Staking(pubkey, event) = event {
+                                let detail = stake_calcuration_details.entry(**pubkey).or_default();
+                                match event {
+                                    InflationPointCalculationEvent::CalculatedPoints(
+                                        epoch,
+                                        stake,
+                                        credits,
+                                        points,
+                                    ) => {
+                                        if *points > 0 {
+                                            detail.epochs += 1;
+                                            detail.points.push(PointDetail {epoch: *epoch, points: *points, stake: *stake, credits: *credits});
+                                        }
+                                    }
+                                    InflationPointCalculationEvent::SplitRewards(
+                                        all,
+                                        voter,
+                                        staker,
+                                        point_value,
+                                    ) => {
+                                        detail.base_rewards = *all;
+                                        detail.vote_rewards = *voter;
+                                        detail.stake_rewards = *staker;
+                                        detail.point_value = Some(point_value.clone());
+                                        // we have duplicate copies of `PointValue`s for possible
+                                        // miscalculation; do some minimum sanity check
+                                        let point_value = detail.point_value.clone();
+                                        if point_value.is_some() {
+                                            if last_point_value.is_some() {
+                                                assert_eq!(last_point_value, point_value,);
+                                            }
+                                            last_point_value = point_value;
+                                        }
+                                    }
+                                    InflationPointCalculationEvent::EffectiveStakeAtRewardedEpoch(stake) => {
+                                        detail.current_effective_stake = *stake;
+                                    }
+                                    InflationPointCalculationEvent::Commission(commission) => {
+                                        detail.commission = *commission;
+                                    }
+                                    InflationPointCalculationEvent::RentExemptReserve(reserve) => {
+                                        detail.rent_exempt_reserve = *reserve;
+                                    }
+                                    InflationPointCalculationEvent::CreditsObserved(
+                                        old_credits_observed,
+                                        new_credits_observed,
+                                    ) => {
+                                        detail.old_credits_observed = Some(*old_credits_observed);
+                                        detail.new_credits_observed = Some(*new_credits_observed);
+                                    }
+                                    InflationPointCalculationEvent::Delegation(
+                                        delegation,
+                                        owner,
+                                    ) => {
+                                        detail.voter = delegation.voter_pubkey;
+                                        detail.voter_owner = *owner;
+                                        detail.total_stake = delegation.stake;
+                                        detail.activation_epoch = delegation.activation_epoch;
+                                        if delegation.deactivation_epoch < Epoch::max_value() {
+                                            detail.deactivation_epoch =
+                                                Some(delegation.deactivation_epoch);
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        let warped_bank = Bank::new_from_parent_with_tracer(
+                            &base_bank,
+                            base_bank.collector_id(),
+                            next_epoch,
+                            tracer,
+                        );
                         warped_bank.freeze();
+                        let mut csv_writer = if arg_matches.is_present("csv_filename") {
+                            let csv_filename =
+                                value_t_or_exit!(arg_matches, "csv_filename", String);
+                            let file = File::create(&csv_filename).unwrap();
+                            Some(csv::WriterBuilder::new().from_writer(file))
+                        } else {
+                            None
+                        };
 
                         println!("Slot: {} => {}", base_bank.slot(), warped_bank.slot());
                         println!("Epoch: {} => {}", base_bank.epoch(), warped_bank.epoch());
                         assert_capitalization(&base_bank);
                         assert_capitalization(&warped_bank);
+                        let interest_per_epoch = ((warped_bank.capitalization() as f64)
+                            / (base_bank.capitalization() as f64)
+                            * 100_f64)
+                            - 100_f64;
+                        let interest_per_year = interest_per_epoch
+                            / warped_bank.epoch_duration_in_years(base_bank.epoch());
                         println!(
-                            "Capitalization: {} => {} (+{} {}%)",
+                            "Capitalization: {} => {} (+{} {}%; annualized {}%)",
                             Sol(base_bank.capitalization()),
                             Sol(warped_bank.capitalization()),
                             Sol(warped_bank.capitalization() - base_bank.capitalization()),
-                            ((warped_bank.capitalization() as f64)
-                                / (base_bank.capitalization() as f64)
-                                * 100_f64),
+                            interest_per_epoch,
+                            interest_per_year,
                         );
 
                         let mut overall_delta = 0;
-                        for (pubkey, warped_account) in
-                            warped_bank.get_all_accounts_modified_since_parent()
-                        {
+
+                        let modified_accounts =
+                            warped_bank.get_all_accounts_modified_since_parent();
+                        let mut rewarded_accounts = modified_accounts
+                            .iter()
+                            .map(|(pubkey, account)| {
+                                (
+                                    pubkey,
+                                    account,
+                                    base_bank
+                                        .get_account(&pubkey)
+                                        .map(|a| a.lamports)
+                                        .unwrap_or_default(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        rewarded_accounts.sort_unstable_by_key(
+                            |(pubkey, account, base_lamports)| {
+                                (
+                                    account.owner,
+                                    *base_lamports,
+                                    account.lamports - base_lamports,
+                                    *pubkey,
+                                )
+                            },
+                        );
+
+                        let mut unchanged_accounts = stake_calcuration_details
+                            .keys()
+                            .collect::<HashSet<_>>()
+                            .difference(
+                                &rewarded_accounts
+                                    .iter()
+                                    .map(|(pubkey, ..)| *pubkey)
+                                    .collect(),
+                            )
+                            .map(|pubkey| (**pubkey, warped_bank.get_account(pubkey).unwrap()))
+                            .collect::<Vec<_>>();
+                        unchanged_accounts.sort_unstable_by_key(|(pubkey, account)| {
+                            (account.owner, account.lamports, *pubkey)
+                        });
+                        let unchanged_accounts = unchanged_accounts.into_iter();
+
+                        let rewarded_accounts = rewarded_accounts
+                            .into_iter()
+                            .map(|(pubkey, account, ..)| (*pubkey, account.clone()));
+
+                        let all_accounts = unchanged_accounts.chain(rewarded_accounts);
+                        for (pubkey, warped_account) in all_accounts {
+                            // Don't output sysvars; it's always updated but not related to
+                            // inflation.
+                            if solana_sdk::sysvar::is_sysvar_id(&pubkey) {
+                                continue;
+                            }
+
                             if let Some(base_account) = base_bank.get_account(&pubkey) {
-                                if base_account.lamports != warped_account.lamports {
-                                    let delta = warped_account.lamports - base_account.lamports;
-                                    println!(
-                                        "{}({}): {} => {} (+{})",
-                                        pubkey,
-                                        base_account.owner,
-                                        Sol(base_account.lamports),
-                                        Sol(warped_account.lamports),
-                                        Sol(delta),
-                                    );
-                                    overall_delta += delta;
+                                let delta = warped_account.lamports - base_account.lamports;
+                                let detail = stake_calcuration_details.get(&pubkey);
+                                println!(
+                                    "{:<45}({}): {} => {} (+{} {:>4.9}%) {:?}",
+                                    format!("{}", pubkey), // format! is needed to pad/justify correctly.
+                                    base_account.owner,
+                                    Sol(base_account.lamports),
+                                    Sol(warped_account.lamports),
+                                    Sol(delta),
+                                    ((warped_account.lamports as f64)
+                                        / (base_account.lamports as f64)
+                                        * 100_f64)
+                                        - 100_f64,
+                                    detail,
+                                );
+                                if let Some(ref mut csv_writer) = csv_writer {
+                                    #[derive(Serialize)]
+                                    struct InflationRecord {
+                                        cluster_type: String,
+                                        rewarded_epoch: Epoch,
+                                        account: String,
+                                        owner: String,
+                                        old_balance: u64,
+                                        new_balance: u64,
+                                        data_size: usize,
+                                        delegation: String,
+                                        delegation_owner: String,
+                                        effective_stake: String,
+                                        delegated_stake: String,
+                                        rent_exempt_reserve: String,
+                                        activation_epoch: String,
+                                        deactivation_epoch: String,
+                                        earned_epochs: String,
+                                        epoch: String,
+                                        epoch_credits: String,
+                                        epoch_points: String,
+                                        epoch_stake: String,
+                                        old_credits_observed: String,
+                                        new_credits_observed: String,
+                                        base_rewards: String,
+                                        stake_rewards: String,
+                                        vote_rewards: String,
+                                        commission: String,
+                                        cluster_rewards: String,
+                                        cluster_points: String,
+                                        old_capitalization: u64,
+                                        new_capitalization: u64,
+                                    }
+                                    fn format_or_na<T: std::fmt::Display>(
+                                        data: Option<T>,
+                                    ) -> String {
+                                        data.map(|data| format!("{}", data))
+                                            .unwrap_or_else(|| "N/A".to_owned())
+                                    }
+                                    let mut point_details = detail
+                                        .map(|d| d.points.iter().map(Some).collect::<Vec<_>>())
+                                        .unwrap_or_default();
+
+                                    // ensure to print even if there is no calculation/point detail
+                                    if point_details.is_empty() {
+                                        point_details.push(None);
+                                    }
+
+                                    for point_detail in point_details {
+                                        let record = InflationRecord {
+                                            cluster_type: format!("{:?}", base_bank.cluster_type()),
+                                            rewarded_epoch: base_bank.epoch(),
+                                            account: format!("{}", pubkey),
+                                            owner: format!("{}", base_account.owner),
+                                            old_balance: base_account.lamports,
+                                            new_balance: warped_account.lamports,
+                                            data_size: base_account.data.len(),
+                                            delegation: format_or_na(detail.map(|d| d.voter)),
+                                            delegation_owner: format_or_na(
+                                                detail.map(|d| d.voter_owner),
+                                            ),
+                                            effective_stake: format_or_na(
+                                                detail.map(|d| d.current_effective_stake),
+                                            ),
+                                            delegated_stake: format_or_na(
+                                                detail.map(|d| d.total_stake),
+                                            ),
+                                            rent_exempt_reserve: format_or_na(
+                                                detail.map(|d| d.rent_exempt_reserve),
+                                            ),
+                                            activation_epoch: format_or_na(detail.map(|d| {
+                                                if d.activation_epoch < Epoch::max_value() {
+                                                    d.activation_epoch
+                                                } else {
+                                                    // bootstraped
+                                                    0
+                                                }
+                                            })),
+                                            deactivation_epoch: format_or_na(
+                                                detail.and_then(|d| d.deactivation_epoch),
+                                            ),
+                                            earned_epochs: format_or_na(detail.map(|d| d.epochs)),
+                                            epoch: format_or_na(point_detail.map(|d| d.epoch)),
+                                            epoch_credits: format_or_na(
+                                                point_detail.map(|d| d.credits),
+                                            ),
+                                            epoch_points: format_or_na(
+                                                point_detail.map(|d| d.points),
+                                            ),
+                                            epoch_stake: format_or_na(
+                                                point_detail.map(|d| d.stake),
+                                            ),
+                                            old_credits_observed: format_or_na(
+                                                detail.and_then(|d| d.old_credits_observed),
+                                            ),
+                                            new_credits_observed: format_or_na(
+                                                detail.and_then(|d| d.new_credits_observed),
+                                            ),
+                                            base_rewards: format_or_na(
+                                                detail.map(|d| d.base_rewards),
+                                            ),
+                                            stake_rewards: format_or_na(
+                                                detail.map(|d| d.stake_rewards),
+                                            ),
+                                            vote_rewards: format_or_na(
+                                                detail.map(|d| d.vote_rewards),
+                                            ),
+                                            commission: format_or_na(detail.map(|d| d.commission)),
+                                            cluster_rewards: format_or_na(
+                                                last_point_value.as_ref().map(|pv| pv.rewards),
+                                            ),
+                                            cluster_points: format_or_na(
+                                                last_point_value.as_ref().map(|pv| pv.points),
+                                            ),
+                                            old_capitalization: base_bank.capitalization(),
+                                            new_capitalization: warped_bank.capitalization(),
+                                        };
+                                        csv_writer.serialize(&record).unwrap();
+                                    }
                                 }
+                                overall_delta += delta;
+                            } else {
+                                error!("new account!?: {}", pubkey);
                             }
                         }
                         if overall_delta > 0 {
@@ -2058,7 +2542,7 @@ fn main() {
                         if arg_matches.is_present("recalculate_capitalization") {
                             eprintln!("Capitalization isn't verified because it's recalculated");
                         }
-                        if arg_matches.is_present("enable_inflation") {
+                        if arg_matches.is_present("inflation") {
                             eprintln!(
                                 "Forcing inflation isn't meaningful because bank isn't warping"
                             );
@@ -2228,7 +2712,7 @@ fn main() {
                         println!("Ledger is empty");
                     } else {
                         let first = slots.first().unwrap();
-                        let last = slots.last().unwrap_or_else(|| first);
+                        let last = slots.last().unwrap_or(first);
                         if first != last {
                             println!("Ledger has data for slots {:?} to {:?}", first, last);
                             if all {
@@ -2246,18 +2730,11 @@ fn main() {
             }
         }
         ("analyze-storage", _) => {
-            match analyze_storage(&open_database(
+            analyze_storage(&open_database(
                 &ledger_path,
                 AccessType::TryPrimaryThenSecondary,
-            )) {
-                Ok(()) => {
-                    println!("Ok.");
-                }
-                Err(err) => {
-                    eprintln!("Unable to read the Ledger: {:?}", err);
-                    exit(1);
-                }
-            }
+            ));
+            println!("Ok.");
         }
         ("", _) => {
             eprintln!("{}", matches.usage());

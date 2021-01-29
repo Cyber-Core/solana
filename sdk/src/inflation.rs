@@ -65,6 +65,21 @@ impl Inflation {
         }
     }
 
+    pub fn pico() -> Self {
+        Self::new_fixed(0.0001) // 0.01% inflation
+    }
+
+    pub fn full() -> Self {
+        Self {
+            initial: DEFAULT_INITIAL,
+            terminal: DEFAULT_TERMINAL,
+            taper: DEFAULT_TAPER,
+            foundation: 0.0,
+            foundation_term: 0.0,
+            __unused: 0.0,
+        }
+    }
+
     /// inflation rate at year
     pub fn total(&self, year: f64) -> f64 {
         assert!(year >= 0.0);
